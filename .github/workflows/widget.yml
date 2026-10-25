@@ -1,0 +1,492 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: Accept Android licenses
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Create project files
+        run: |
+          mkdir -p btc-widget && cd btc-widget
+          mkdir -p $(dirname 'app/build.gradle.kts')
+          cat > 'app/build.gradle.kts' <<'END_OF_FILE_X'
+          plugins { id("com.android.application"); id("org.jetbrains.kotlin.android") }
+          android {
+              namespace = "com.btcwidget"
+              compileSdk = 34
+              defaultConfig { applicationId = "com.btcwidget"; minSdk = 26; targetSdk = 34; versionCode = 1; versionName = "1.0" }
+              compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          dependencies { implementation("androidx.core:core-ktx:1.13.1") }
+          END_OF_FILE_X
+          mkdir -p $(dirname 'app/src/main/AndroidManifest.xml')
+          cat > 'app/src/main/AndroidManifest.xml' <<'END_OF_FILE_X'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE"/>
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+              <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
+              <queries>
+                  <intent>
+                      <action android:name="android.intent.action.MAIN"/>
+                      <category android:name="android.intent.category.LAUNCHER"/>
+                  </intent>
+              </queries>
+              <application android:label="@string/app_name" android:theme="@android:style/Theme.Material.Light.DarkActionBar">
+                  <activity android:name=".SettingsActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+                  <receiver android:name=".WidgetProvider" android:exported="true">
+                      <intent-filter><action android:name="android.appwidget.action.APPWIDGET_UPDATE"/></intent-filter>
+                      <meta-data android:name="android.appwidget.provider" android:resource="@xml/widget_info"/>
+                  </receiver>
+                  <receiver android:name=".BootReceiver" android:exported="true">
+                      <intent-filter><action android:name="android.intent.action.BOOT_COMPLETED"/></intent-filter>
+                  </receiver>
+                  <service android:name=".UpdateService" android:exported="false" android:foregroundServiceType="specialUse">
+                      <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE" android:value="live widget refresh"/>
+                  </service>
+              </application>
+          </manifest>
+          END_OF_FILE_X
+          mkdir -p $(dirname 'app/src/main/java/com/btcwidget/Adx.kt')
+          cat > 'app/src/main/java/com/btcwidget/Adx.kt' <<'END_OF_FILE_X'
+          package com.btcwidget
+
+          import kotlin.math.abs
+
+          object Adx {
+              /** Wilder ADX. Returns (ADX, +DI, -DI); includes the currently forming candle. */
+              fun calc(h: List<Double>, l: List<Double>, c: List<Double>, n: Int = 14): Triple<Double, Double, Double>? {
+                  if (c.size < 2 * n + 1) return null
+                  var str = 0.0; var sp = 0.0; var sm = 0.0
+                  var adx = 0.0; var pdi = 0.0; var mdi = 0.0
+                  val dx = ArrayList<Double>()
+                  for (i in 1 until c.size) {
+                      val up = h[i] - h[i - 1]; val dn = l[i - 1] - l[i]
+                      val pdm = if (up > dn && up > 0) up else 0.0
+                      val mdm = if (dn > up && dn > 0) dn else 0.0
+                      val tr = maxOf(h[i] - l[i], abs(h[i] - c[i - 1]), abs(l[i] - c[i - 1]))
+                      if (i <= n) { str += tr; sp += pdm; sm += mdm }
+                      else { str = str - str / n + tr; sp = sp - sp / n + pdm; sm = sm - sm / n + mdm }
+                      if (i >= n) {
+                          pdi = 100 * sp / str; mdi = 100 * sm / str
+                          val d = 100 * abs(pdi - mdi) / (pdi + mdi).coerceAtLeast(1e-9)
+                          if (dx.size < n) { dx.add(d); if (dx.size == n) adx = dx.average() }
+                          else adx = (adx * (n - 1) + d) / n
+                      }
+                  }
+                  return Triple(adx, pdi, mdi)
+              }
+          }
+          END_OF_FILE_X
+          mkdir -p $(dirname 'app/src/main/java/com/btcwidget/Delta.kt')
+          cat > 'app/src/main/java/com/btcwidget/Delta.kt' <<'END_OF_FILE_X'
+          package com.btcwidget
+
+          import org.json.JSONObject
+          import java.net.HttpURLConnection
+          import java.net.URL
+          import javax.crypto.Mac
+          import javax.crypto.spec.SecretKeySpec
+
+          object Delta {
+              const val BASE = "https://api.india.delta.exchange"
+              const val SYMBOL = "BTCUSD"
+
+              fun secs(tf: String) = when (tf) {
+                  "1m" -> 60; "3m" -> 180; "5m" -> 300; "15m" -> 900; "30m" -> 1800; "1h" -> 3600; else -> 14400
+              }
+
+              private fun get(path: String, query: String, key: String?, secret: String?): JSONObject {
+                  val q = if (query.isEmpty()) "" else "?$query"
+                  val c = URL(BASE + path + q).openConnection() as HttpURLConnection
+                  c.connectTimeout = 3000; c.readTimeout = 3000
+                  c.setRequestProperty("User-Agent", "btc-widget")
+                  c.setRequestProperty("Accept", "application/json")
+                  if (key != null && secret != null) {
+                      val ts = (System.currentTimeMillis() / 1000).toString()
+                      val mac = Mac.getInstance("HmacSHA256")
+                      mac.init(SecretKeySpec(secret.toByteArray(), "HmacSHA256"))
+                      val sig = mac.doFinal(("GET" + ts + path + q).toByteArray()).joinToString("") { "%02x".format(it) }
+                      c.setRequestProperty("api-key", key)
+                      c.setRequestProperty("timestamp", ts)
+                      c.setRequestProperty("signature", sig)
+                  }
+                  val body = (if (c.responseCode in 200..299) c.inputStream else c.errorStream).bufferedReader().readText()
+                  c.disconnect()
+                  return JSONObject(body)
+              }
+
+              fun price(): Double =
+                  get("/v2/tickers/$SYMBOL", "", null, null).getJSONObject("result").getString("mark_price").toDouble()
+
+              /** Sum of unrealized PnL over all open margined positions. */
+              fun pnl(key: String, secret: String): Double {
+                  val r = get("/v2/positions/margined", "", key, secret).getJSONArray("result")
+                  var sum = 0.0
+                  for (i in 0 until r.length()) sum += r.getJSONObject(i).optString("unrealized_pnl", "0").toDoubleOrNull() ?: 0.0
+                  return sum
+              }
+
+              fun candles(tf: String): Triple<List<Double>, List<Double>, List<Double>> {
+                  val now = System.currentTimeMillis() / 1000
+                  val r = get("/v2/history/candles",
+                      "resolution=$tf&symbol=$SYMBOL&start=${now - secs(tf) * 120}&end=$now", null, null).getJSONArray("result")
+                  val rows = (0 until r.length()).map { r.getJSONObject(it) }.sortedBy { it.getLong("time") }
+                  return Triple(rows.map { it.getDouble("high") }, rows.map { it.getDouble("low") }, rows.map { it.getDouble("close") })
+              }
+          }
+          END_OF_FILE_X
+          mkdir -p $(dirname 'app/src/main/java/com/btcwidget/Prefs.kt')
+          cat > 'app/src/main/java/com/btcwidget/Prefs.kt' <<'END_OF_FILE_X'
+          package com.btcwidget
+
+          import android.content.Context
+
+          object Prefs {
+              const val DEFAULT_CHART = "https://india.delta.exchange/app/futures/trade/BTC/BTCUSD"
+              const val ACTION_CYCLE = "com.btcwidget.CYCLE"
+              val TFS = listOf("1m", "3m", "5m", "15m", "30m", "1h", "4h")
+              fun sp(c: Context) = c.getSharedPreferences("w", Context.MODE_PRIVATE)
+              fun alpha(c: Context) = sp(c).getInt("alpha", 180)
+              fun tf(c: Context) = sp(c).getString("tf", "15m")!!
+              fun str(c: Context, k: String) = sp(c).getString(k, "")!!.trim()
+          }
+          END_OF_FILE_X
+          mkdir -p $(dirname 'app/src/main/java/com/btcwidget/SettingsActivity.kt')
+          cat > 'app/src/main/java/com/btcwidget/SettingsActivity.kt' <<'END_OF_FILE_X'
+          package com.btcwidget
+
+          import android.app.Activity
+          import android.app.AlertDialog
+          import android.content.Intent
+          import android.os.Build
+          import android.os.Bundle
+          import android.widget.*
+          import androidx.core.widget.doAfterTextChanged
+
+          class SettingsActivity : Activity() {
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  if (Build.VERSION.SDK_INT >= 33)
+                      requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 1)
+                  val sp = Prefs.sp(this)
+                  val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(40, 40, 40, 40) }
+                  fun label(t: String) = root.addView(TextView(this).apply { text = t; setPadding(0, 32, 0, 0) })
+
+                  label("Widget transparency (left = clear, right = solid)")
+                  root.addView(SeekBar(this).apply {
+                      max = 255; progress = Prefs.alpha(this@SettingsActivity)
+                      setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                          override fun onProgressChanged(s: SeekBar?, p: Int, u: Boolean) { sp.edit().putInt("alpha", p).apply() }
+                          override fun onStartTrackingTouch(s: SeekBar?) {}
+                          override fun onStopTrackingTouch(s: SeekBar?) {}
+                      })
+                  })
+
+                  fun field(k: String, hint: String) {
+                      label(hint)
+                      root.addView(EditText(this).apply {
+                          setText(sp.getString(k, "")); setSingleLine()
+                          doAfterTextChanged { sp.edit().putString(k, it.toString().trim()).apply() }
+                      })
+                  }
+                  field("key", "Delta API key (read-only)")
+                  field("secret", "Delta API secret")
+
+                  fun pick(k: String, title: String) {
+                      val btn = Button(this)
+                      fun refresh() { btn.text = "$title: " + sp.getString(k, "").orEmpty().ifEmpty { "tap to pick (else opens website)" } }
+                      refresh()
+                      btn.setOnClickListener {
+                          val pm = packageManager
+                          val apps = pm.queryIntentActivities(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), 0)
+                              .sortedBy { it.loadLabel(pm).toString().lowercase() }
+                          AlertDialog.Builder(this).setTitle(title)
+                              .setItems(apps.map { it.loadLabel(pm).toString() }.toTypedArray()) { _, i ->
+                                  sp.edit().putString(k, apps[i].activityInfo.packageName).apply()
+                                  refresh(); WidgetProvider.start(this)
+                              }.show()
+                      }
+                      root.addView(btn)
+                  }
+                  label("Buttons on the widget open these installed apps")
+                  pick("dpkg", "Delta Exchange app")
+                  pick("tpkg", "Tradetron app")
+
+                  field("chartUrl", "Chart link for the Chart button (blank = default BTCUSD link; falls back to opening the app)")
+                  root.addView(TextView(this).apply {
+                      text = "\nTip: tap the ADX line on the widget to cycle the candle timeframe (1m, 3m, 5m, 15m, 30m, 1h, 4h)."
+                  })
+                  setContentView(ScrollView(this).apply { addView(root) })
+                  WidgetProvider.start(this)
+              }
+          }
+          END_OF_FILE_X
+          mkdir -p $(dirname 'app/src/main/java/com/btcwidget/UpdateService.kt')
+          cat > 'app/src/main/java/com/btcwidget/UpdateService.kt' <<'END_OF_FILE_X'
+          package com.btcwidget
+
+          import android.app.*
+          import android.appwidget.AppWidgetManager
+          import android.content.ComponentName
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.graphics.Bitmap
+          import android.graphics.drawable.Drawable
+          import android.net.Uri
+          import android.os.Build
+          import android.os.IBinder
+          import android.widget.RemoteViews
+          import androidx.core.graphics.drawable.toBitmap
+          import java.util.Locale
+          import java.util.concurrent.Callable
+          import java.util.concurrent.Executors
+          import java.util.concurrent.Future
+          import java.util.concurrent.TimeUnit
+
+          class UpdateService : Service() {
+              private val pool = Executors.newFixedThreadPool(3)
+              private val loop = Executors.newSingleThreadScheduledExecutor()
+              private var started = false
+
+              override fun onBind(i: Intent?): IBinder? = null
+
+              override fun onCreate() {
+                  super.onCreate()
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(NotificationChannel("w", "Widget refresh", NotificationManager.IMPORTANCE_MIN))
+                  val n = Notification.Builder(this, "w").setContentTitle("BTC widget running")
+                      .setSmallIcon(android.R.drawable.ic_dialog_info).build()
+                  if (Build.VERSION.SDK_INT >= 34) startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+                  else startForeground(1, n)
+              }
+
+              override fun onStartCommand(i: Intent?, f: Int, id: Int): Int {
+                  initWidget()
+                  if (!started) {
+                      started = true
+                      loop.scheduleWithFixedDelay({ try { tick() } catch (_: Exception) {} }, 0, 1, TimeUnit.SECONDS)
+                  }
+                  return START_STICKY
+              }
+
+              private fun ids() = AppWidgetManager.getInstance(this)
+                  .getAppWidgetIds(ComponentName(this, WidgetProvider::class.java))
+
+              private fun icon(pkg: String): Bitmap {
+                  val d: Drawable = try { packageManager.getApplicationIcon(pkg) }
+                  catch (e: Exception) { getDrawable(android.R.drawable.sym_def_app_icon)!! }
+                  return d.toBitmap(96, 96)
+              }
+
+              private fun open(code: Int, pkg: String, fallback: String): PendingIntent {
+                  val i = (if (pkg.isNotEmpty()) packageManager.getLaunchIntentForPackage(pkg) else null)
+                      ?: Intent(Intent.ACTION_VIEW, Uri.parse(fallback))
+                  i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                  return PendingIntent.getActivity(this, code, i, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+              }
+
+              /** Chart button: deep link into the Delta app if it handles the URL, else just open the app. */
+              private fun chart(pkg: String, url: String): PendingIntent {
+                  var i: Intent? = null
+                  if (pkg.isNotEmpty() && url.isNotEmpty()) {
+                      val v = Intent(Intent.ACTION_VIEW, Uri.parse(url)).setPackage(pkg)
+                      if (packageManager.resolveActivity(v, 0) != null) i = v
+                  }
+                  if (i == null) i = (if (pkg.isNotEmpty()) packageManager.getLaunchIntentForPackage(pkg) else null)
+                      ?: Intent(Intent.ACTION_VIEW, Uri.parse(url.ifEmpty { "https://india.delta.exchange" }))
+                  i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                  return PendingIntent.getActivity(this, 5, i, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+              }
+
+              /** Full update: icons + click targets. Text is refreshed by tick(). */
+              private fun initWidget() {
+                  val rv = RemoteViews(packageName, R.layout.widget)
+                  val dp = Prefs.str(this, "dpkg"); val tp = Prefs.str(this, "tpkg")
+                  rv.setImageViewBitmap(R.id.btnDelta, icon(dp))
+                  rv.setImageViewBitmap(R.id.btnTt, icon(tp))
+                  rv.setOnClickPendingIntent(R.id.btnDelta, open(1, dp, "https://india.delta.exchange"))
+                  rv.setOnClickPendingIntent(R.id.btnTt, open(2, tp, "https://tradetron.tech"))
+                  rv.setOnClickPendingIntent(R.id.btnChart, chart(dp, Prefs.str(this, "chartUrl").ifEmpty { Prefs.DEFAULT_CHART }))
+                  rv.setOnClickPendingIntent(R.id.gear, PendingIntent.getActivity(this, 3,
+                      Intent(this, SettingsActivity::class.java), PendingIntent.FLAG_IMMUTABLE))
+                  rv.setOnClickPendingIntent(R.id.adx, PendingIntent.getBroadcast(this, 4,
+                      Intent(this, WidgetProvider::class.java).setAction(Prefs.ACTION_CYCLE), PendingIntent.FLAG_IMMUTABLE))
+                  AppWidgetManager.getInstance(this).updateAppWidget(ids(), rv)
+              }
+
+              private fun <T> async(f: () -> T): Future<T?> = pool.submit(Callable<T?> { try { f() } catch (e: Exception) { null } })
+
+              private fun tick() {
+                  val tf = Prefs.tf(this)
+                  val key = Prefs.str(this, "key"); val sec = Prefs.str(this, "secret")
+                  val p = async { Delta.price() }
+                  val n = async { if (key.isEmpty()) null else Delta.pnl(key, sec) }
+                  val a = async { val (h, l, c) = Delta.candles(tf); Adx.calc(h, l, c) }
+                  push(tf, p.get(), n.get(), a.get())
+              }
+
+              private fun push(tf: String, price: Double?, pnl: Double?, adx: Triple<Double, Double, Double>?) {
+                  val rv = RemoteViews(packageName, R.layout.widget)
+                  val L = Locale.US
+                  rv.setInt(R.id.bg, "setImageAlpha", Prefs.alpha(this))
+                  rv.setTextViewText(R.id.price, if (price == null) "BTC --" else String.format(L, "BTC %,.1f", price))
+                  if (pnl == null) {
+                      rv.setTextViewText(R.id.pnl, "PnL --"); rv.setTextColor(R.id.pnl, 0xFFAAAAAA.toInt())
+                  } else {
+                      rv.setTextViewText(R.id.pnl, String.format(L, "PnL %+,.2f", pnl))
+                      rv.setTextColor(R.id.pnl, if (pnl >= 0) 0xFF4CD964.toInt() else 0xFFFF5A5F.toInt())
+                  }
+                  rv.setTextViewText(R.id.adx, if (adx == null) "ADX $tf: --  (tap = timeframe)"
+                      else String.format(L, "ADX %s: %.1f  +DI %.0f  -DI %.0f", tf, adx.first, adx.second, adx.third))
+                  AppWidgetManager.getInstance(this).partiallyUpdateAppWidget(ids(), rv)
+              }
+
+              override fun onDestroy() { loop.shutdownNow(); pool.shutdownNow(); super.onDestroy() }
+          }
+          END_OF_FILE_X
+          mkdir -p $(dirname 'app/src/main/java/com/btcwidget/WidgetProvider.kt')
+          cat > 'app/src/main/java/com/btcwidget/WidgetProvider.kt' <<'END_OF_FILE_X'
+          package com.btcwidget
+
+          import android.appwidget.AppWidgetManager
+          import android.appwidget.AppWidgetProvider
+          import android.content.BroadcastReceiver
+          import android.content.Context
+          import android.content.Intent
+
+          class WidgetProvider : AppWidgetProvider() {
+              override fun onUpdate(c: Context, m: AppWidgetManager, ids: IntArray) = start(c)
+              override fun onEnabled(c: Context) = start(c)
+
+              override fun onReceive(c: Context, i: Intent) {
+                  super.onReceive(c, i)
+                  if (i.action == Prefs.ACTION_CYCLE) {
+                      val next = Prefs.TFS[(Prefs.TFS.indexOf(Prefs.tf(c)) + 1) % Prefs.TFS.size]
+                      Prefs.sp(c).edit().putString("tf", next).apply()
+                  }
+              }
+
+              companion object {
+                  fun start(c: Context) {
+                      try { c.startForegroundService(Intent(c, UpdateService::class.java)) } catch (_: Exception) {}
+                  }
+              }
+          }
+
+          class BootReceiver : BroadcastReceiver() {
+              override fun onReceive(c: Context, i: Intent) = WidgetProvider.start(c)
+          }
+          END_OF_FILE_X
+          mkdir -p $(dirname 'app/src/main/res/drawable/bg.xml')
+          cat > 'app/src/main/res/drawable/bg.xml' <<'END_OF_FILE_X'
+          <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+              <solid android:color="#101418"/>
+              <corners android:radius="18dp"/>
+          </shape>
+          END_OF_FILE_X
+          mkdir -p $(dirname 'app/src/main/res/drawable/btn_bg.xml')
+          cat > 'app/src/main/res/drawable/btn_bg.xml' <<'END_OF_FILE_X'
+          <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+              <solid android:color="#2A7DE1"/>
+              <corners android:radius="10dp"/>
+          </shape>
+          END_OF_FILE_X
+          mkdir -p $(dirname 'app/src/main/res/layout/widget.xml')
+          cat > 'app/src/main/res/layout/widget.xml' <<'END_OF_FILE_X'
+          <?xml version="1.0" encoding="utf-8"?>
+          <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:layout_width="match_parent" android:layout_height="match_parent">
+              <ImageView android:id="@+id/bg" android:layout_width="match_parent" android:layout_height="match_parent"
+                  android:scaleType="fitXY" android:src="@drawable/bg"/>
+              <LinearLayout android:layout_width="match_parent" android:layout_height="match_parent"
+                  android:orientation="vertical" android:padding="10dp">
+                  <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+                      android:orientation="horizontal" android:gravity="center_vertical">
+                      <TextView android:id="@+id/price" android:layout_width="0dp" android:layout_height="wrap_content"
+                          android:layout_weight="1" android:text="BTC --" android:textColor="#FFFFFF"
+                          android:textSize="22sp" android:textStyle="bold"/>
+                      <ImageView android:id="@+id/gear" android:layout_width="24dp" android:layout_height="24dp"
+                          android:src="@android:drawable/ic_menu_preferences"/>
+                  </LinearLayout>
+                  <TextView android:id="@+id/pnl" android:layout_width="wrap_content" android:layout_height="wrap_content"
+                      android:text="PnL --" android:textColor="#AAAAAA" android:textSize="17sp" android:textStyle="bold"/>
+                  <TextView android:id="@+id/adx" android:layout_width="wrap_content" android:layout_height="wrap_content"
+                      android:text="ADX --" android:textColor="#DDDDDD" android:textSize="14sp"/>
+                  <LinearLayout android:layout_width="match_parent" android:layout_height="0dp" android:layout_weight="1"
+                      android:orientation="horizontal" android:gravity="center_vertical">
+                      <ImageView android:id="@+id/btnDelta" android:layout_width="38dp" android:layout_height="38dp"
+                          android:layout_marginEnd="14dp"/>
+                      <ImageView android:id="@+id/btnTt" android:layout_width="38dp" android:layout_height="38dp"
+                          android:layout_marginEnd="14dp"/>
+                      <TextView android:id="@+id/btnChart" android:layout_width="wrap_content" android:layout_height="34dp"
+                          android:background="@drawable/btn_bg" android:gravity="center" android:paddingStart="16dp"
+                          android:paddingEnd="16dp" android:text="Chart" android:textColor="#FFFFFF"
+                          android:textSize="14sp" android:textStyle="bold"/>
+                  </LinearLayout>
+              </LinearLayout>
+          </FrameLayout>
+          END_OF_FILE_X
+          mkdir -p $(dirname 'app/src/main/res/values/strings.xml')
+          cat > 'app/src/main/res/values/strings.xml' <<'END_OF_FILE_X'
+          <resources><string name="app_name">BTC Widget</string></resources>
+          END_OF_FILE_X
+          mkdir -p $(dirname 'app/src/main/res/xml/widget_info.xml')
+          cat > 'app/src/main/res/xml/widget_info.xml' <<'END_OF_FILE_X'
+          <appwidget-provider xmlns:android="http://schemas.android.com/apk/res/android"
+              android:minWidth="250dp" android:minHeight="110dp"
+              android:updatePeriodMillis="0"
+              android:resizeMode="horizontal|vertical"
+              android:widgetCategory="home_screen"
+              android:initialLayout="@layout/widget"/>
+          END_OF_FILE_X
+          mkdir -p $(dirname 'build.gradle.kts')
+          cat > 'build.gradle.kts' <<'END_OF_FILE_X'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          END_OF_FILE_X
+          mkdir -p $(dirname 'gradle.properties')
+          cat > 'gradle.properties' <<'END_OF_FILE_X'
+          android.useAndroidX=true
+          END_OF_FILE_X
+          mkdir -p $(dirname 'gradle/wrapper/gradle-wrapper.properties')
+          cat > 'gradle/wrapper/gradle-wrapper.properties' <<'END_OF_FILE_X'
+          distributionBase=GRADLE_USER_HOME
+          distributionPath=wrapper/dists
+          distributionUrl=https\://services.gradle.org/distributions/gradle-8.7-bin.zip
+          zipStoreBase=GRADLE_USER_HOME
+          zipStorePath=wrapper/dists
+          END_OF_FILE_X
+          mkdir -p $(dirname 'settings.gradle.kts')
+          cat > 'settings.gradle.kts' <<'END_OF_FILE_X'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "BtcWidget"
+          include(":app")
+          END_OF_FILE_X
+      - name: Build
+        run: cd btc-widget && gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: btc-widget-apk
+          path: btc-widget/app/build/outputs/apk/debug/app-debug.apk
