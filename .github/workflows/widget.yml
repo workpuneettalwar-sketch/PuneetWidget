@@ -140,8 +140,36 @@ jobs:
                   return j
               }
 
-              fun price(): Double =
-                  get("/v2/tickers/$SYMBOL", "", null, null).getJSONObject("result").getString("mark_price").toDouble()
+              fun mark(sym: String): Double =
+                  get("/v2/tickers/$sym", "", null, null).getJSONObject("result").getString("mark_price").toDouble()
+
+              fun price(): Double = mark(SYMBOL)
+
+              private val ycache = java.util.concurrent.ConcurrentHashMap<String, Pair<Long, Double>>()
+
+              /** Yahoo Finance quote (unofficial, no key). Cached 5 s to stay polite. */
+              fun yahoo(sym: String): Double {
+                  val now = System.currentTimeMillis()
+                  ycache[sym]?.let { if (now - it.first < 5000) return it.second }
+                  val u = "https://query1.finance.yahoo.com/v8/finance/chart/" +
+                      java.net.URLEncoder.encode(sym, "UTF-8") + "?interval=1m&range=1d"
+                  val c = URL(u).openConnection() as HttpURLConnection
+                  c.connectTimeout = 3000; c.readTimeout = 3000
+                  c.setRequestProperty("User-Agent", "Mozilla/5.0")
+                  val body = c.inputStream.bufferedReader().readText()
+                  c.disconnect()
+                  val v = JSONObject(body).getJSONObject("chart").getJSONArray("result").getJSONObject(0)
+                      .getJSONObject("meta").getDouble("regularMarketPrice")
+                  ycache[sym] = Pair(now, v)
+                  return v
+              }
+
+              fun extra(name: String): Double = when (name) {
+                  "ETH" -> mark("ETHUSD")
+                  "GOLD" -> try { mark("XAUUSD") } catch (e: Exception) { yahoo("GC=F") }
+                  "NIFTY" -> yahoo("^NSEI")
+                  else -> throw Exception("unknown $name")
+              }
 
               @Volatile var pnlErr = ""
 
@@ -194,6 +222,14 @@ jobs:
                   val l = str(c, "tfs").split(",").map { it.trim() }.filter { it in TFS }.distinct().take(4)
                   return if (l.isEmpty()) listOf("5m", "15m", "1h") else l
               }
+              fun extras(c: Context): List<String> {
+                  val s = str(c, "extras").uppercase()
+                  if (s == "NONE") return emptyList()
+                  val l = s.split(",").map { it.trim() }.filter { it in listOf("ETH", "GOLD", "NIFTY") }.distinct()
+                  return if (l.isEmpty()) listOf("ETH", "GOLD", "NIFTY") else l
+              }
+              fun rate(c: Context) = str(c, "rate").toDoubleOrNull() ?: 0.0
+              val SLOT_KEYS = listOf("tvpkg", "dpkg", "tpkg", "app4", "app5", "app6")
               fun alpha(c: Context) = sp(c).getInt("alpha", 180)
               fun tf(c: Context) = sp(c).getString("tf", "15m")!!
               fun str(c: Context, k: String) = sp(c).getString(k, "")!!.trim()
@@ -239,6 +275,8 @@ jobs:
                   }
                   field("key", "Delta API key (read-only)")
                   field("secret", "Delta API secret")
+                  field("extras", "Extra prices under BTC: ETH, GOLD, NIFTY (comma-separated; blank = all three; none = hide)")
+                  field("rate", "PnL in INR: Delta's fixed USD-to-INR rate (blank = show in $)")
                   field("tfs", "ADX timeframes, comma-separated (blank = 5m,15m,1h; options 1m,3m,5m,15m,30m,1h,4h)")
 
                   fun pick(k: String, title: String) {
@@ -250,17 +288,20 @@ jobs:
                           val apps = pm.queryIntentActivities(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), 0)
                               .sortedBy { it.loadLabel(pm).toString().lowercase() }
                           AlertDialog.Builder(this).setTitle(title)
-                              .setItems(apps.map { it.loadLabel(pm).toString() }.toTypedArray()) { _, i ->
-                                  sp.edit().putString(k, apps[i].activityInfo.packageName).apply()
+                              .setItems((listOf("None (empty slot)") + apps.map { it.loadLabel(pm).toString() }).toTypedArray()) { _, i ->
+                                  sp.edit().putString(k, if (i == 0) "" else apps[i - 1].activityInfo.packageName).apply()
                                   refresh(); WidgetProvider.start(this)
                               }.show()
                       }
                       root.addView(btn)
                   }
-                  label("Buttons on the widget open these installed apps")
-                  pick("tvpkg", "TradingView app")
-                  pick("dpkg", "Delta Exchange app")
-                  pick("tpkg", "Tradetron app")
+                  label("Widget buttons (3 per row, second row appears when used)")
+                  pick("tvpkg", "Button 1 (TradingView)")
+                  pick("dpkg", "Button 2 (Delta Exchange)")
+                  pick("tpkg", "Button 3 (Tradetron)")
+                  pick("app4", "Button 4")
+                  pick("app5", "Button 5")
+                  pick("app6", "Button 6")
 
                   setContentView(ScrollView(this).apply { addView(root) })
                   WidgetProvider.start(this)
@@ -281,6 +322,7 @@ jobs:
           import android.net.Uri
           import android.os.Build
           import android.os.IBinder
+          import android.view.View
           import android.widget.RemoteViews
           import androidx.core.graphics.drawable.toBitmap
           import java.util.Locale
@@ -290,9 +332,12 @@ jobs:
           import java.util.concurrent.TimeUnit
 
           class UpdateService : Service() {
-              private val pool = Executors.newFixedThreadPool(8)
+              private val pool = Executors.newFixedThreadPool(12)
               private val loop = Executors.newSingleThreadScheduledExecutor()
               private var started = false
+
+              private val slotIds = listOf(R.id.btn1, R.id.btn2, R.id.btn3, R.id.btn4, R.id.btn5, R.id.btn6)
+              private val fallbacks = listOf("https://www.tradingview.com", "https://india.delta.exchange", "https://tradetron.tech", null, null, null)
 
               override fun onBind(i: Intent?): IBinder? = null
 
@@ -321,7 +366,7 @@ jobs:
               private fun icon(pkg: String): Bitmap {
                   val d: Drawable = try { packageManager.getApplicationIcon(pkg) }
                   catch (e: Exception) { getDrawable(android.R.drawable.sym_def_app_icon)!! }
-                  return d.toBitmap(96, 96)
+                  return d.toBitmap(120, 120)
               }
 
               private fun open(code: Int, pkg: String, fallback: String): PendingIntent {
@@ -334,13 +379,16 @@ jobs:
               /** Full update: icons + click targets. Text is refreshed by tick(). */
               private fun initWidget() {
                   val rv = RemoteViews(packageName, R.layout.widget)
-                  val dp = Prefs.str(this, "dpkg"); val tp = Prefs.str(this, "tpkg"); val tv = Prefs.str(this, "tvpkg")
-                  rv.setImageViewBitmap(R.id.btnTv, icon(tv))
-                  rv.setImageViewBitmap(R.id.btnDelta, icon(dp))
-                  rv.setImageViewBitmap(R.id.btnTt, icon(tp))
-                  rv.setOnClickPendingIntent(R.id.btnTv, open(6, tv, "https://www.tradingview.com"))
-                  rv.setOnClickPendingIntent(R.id.btnDelta, open(1, dp, "https://india.delta.exchange"))
-                  rv.setOnClickPendingIntent(R.id.btnTt, open(2, tp, "https://tradetron.tech"))
+                  for (i in 0 until 6) {
+                      val pkg = Prefs.str(this, Prefs.SLOT_KEYS[i])
+                      val fb = fallbacks[i]
+                      if (pkg.isEmpty() && fb == null) { rv.setViewVisibility(slotIds[i], View.GONE); continue }
+                      rv.setViewVisibility(slotIds[i], View.VISIBLE)
+                      rv.setImageViewBitmap(slotIds[i], icon(pkg))
+                      rv.setOnClickPendingIntent(slotIds[i], open(10 + i, pkg, fb ?: "https://www.google.com"))
+                  }
+                  val row2Used = (3 until 6).any { Prefs.str(this, Prefs.SLOT_KEYS[it]).isNotEmpty() }
+                  rv.setViewVisibility(R.id.row2, if (row2Used) View.VISIBLE else View.GONE)
                   rv.setOnClickPendingIntent(R.id.gear, PendingIntent.getActivity(this, 3,
                       Intent(this, SettingsActivity::class.java), PendingIntent.FLAG_IMMUTABLE))
                   AppWidgetManager.getInstance(this).updateAppWidget(ids(), rv)
@@ -350,6 +398,7 @@ jobs:
 
               private fun tick() {
                   val tfs = Prefs.tfs(this)
+                  val extras = Prefs.extras(this)
                   val key = Prefs.str(this, "key"); val sec = Prefs.str(this, "secret")
                   val p = async { Delta.price() }
                   val n = async {
@@ -358,20 +407,31 @@ jobs:
                       catch (e: Exception) { Delta.pnlErr = e.message ?: e.javaClass.simpleName; null }
                   }
                   val a = tfs.map { tf -> async { val (h, l, c) = Delta.candles(tf); Adx.calc(h, l, c)?.first } }
-                  push(p.get(), n.get(), tfs.zip(a.map { it.get() }))
+                  val x = extras.map { name -> async { Delta.extra(name) } }
+                  push(p.get(), n.get(), tfs.zip(a.map { it.get() }), extras.zip(x.map { it.get() }))
               }
 
-              private fun push(price: Double?, pnl: Pair<Double, Int>?, adx: List<Pair<String, Double?>>) {
+              private fun push(price: Double?, pnl: Pair<Double, Int>?, adx: List<Pair<String, Double?>>,
+                               extras: List<Pair<String, Double?>>) {
                   val rv = RemoteViews(packageName, R.layout.widget)
                   val L = Locale.US
                   rv.setInt(R.id.bg, "setImageAlpha", Prefs.alpha(this))
                   rv.setTextViewText(R.id.price, if (price == null) "BTC --" else String.format(L, "BTC %,.1f", price))
+                  if (extras.isEmpty()) rv.setViewVisibility(R.id.more, View.GONE)
+                  else {
+                      rv.setViewVisibility(R.id.more, View.VISIBLE)
+                      rv.setTextViewText(R.id.more, extras.joinToString("  |  ") { (n, v) ->
+                          if (v == null) "$n --" else String.format(L, "%s %,.1f", n, v) })
+                  }
                   if (pnl == null) {
                       rv.setTextViewText(R.id.pnl, "PnL: " + Delta.pnlErr.ifEmpty { "--" }); rv.setTextColor(R.id.pnl, 0xFFAAAAAA.toInt())
                       rv.setTextViewText(R.id.pos, "Pos --")
                   } else {
-                      rv.setTextViewText(R.id.pnl, String.format(L, "PnL %+,.2f", pnl.first))
-                      rv.setTextColor(R.id.pnl, if (pnl.first >= 0) 0xFF4CD964.toInt() else 0xFFFF5A5F.toInt())
+                      val rate = Prefs.rate(this)
+                      val v = if (rate > 0) pnl.first * rate else pnl.first
+                      val sym = if (rate > 0) "\u20B9" else "$"
+                      rv.setTextViewText(R.id.pnl, String.format(L, "PnL %s%s%,.2f", if (v < 0) "-" else "+", sym, Math.abs(v)))
+                      rv.setTextColor(R.id.pnl, if (v >= 0) 0xFF4CD964.toInt() else 0xFFFF5A5F.toInt())
                       rv.setTextViewText(R.id.pos, "Pos ${pnl.second}")
                   }
                   rv.setTextViewText(R.id.adx, "ADX  " + adx.joinToString("  |  ") { (tf, v) ->
@@ -446,25 +506,37 @@ jobs:
                       <ImageView android:id="@+id/gear" android:layout_width="24dp" android:layout_height="24dp"
                           android:src="@android:drawable/ic_menu_preferences"/>
                   </LinearLayout>
+                  <TextView android:id="@+id/more" android:layout_width="match_parent" android:layout_height="wrap_content"
+                      android:text="" android:textColor="#C8D0D8" android:textSize="12sp"
+                      android:singleLine="true" android:ellipsize="end"/>
                   <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
                       android:orientation="horizontal" android:gravity="center_vertical">
-                      <TextView android:id="@+id/pnl" android:layout_width="0dp" android:layout_height="wrap_content"
-                          android:layout_weight="1" android:text="PnL --" android:textColor="#AAAAAA"
-                          android:textSize="16sp" android:textStyle="bold" android:singleLine="true" android:ellipsize="end"/>
+                      <TextView android:id="@+id/pnl" android:layout_width="wrap_content" android:layout_height="wrap_content"
+                          android:text="PnL --" android:textColor="#AAAAAA" android:textSize="16sp"
+                          android:textStyle="bold" android:singleLine="true" android:ellipsize="end"/>
                       <TextView android:id="@+id/pos" android:layout_width="wrap_content" android:layout_height="wrap_content"
-                          android:text="Pos --" android:textColor="#FFFFFF" android:textSize="14sp" android:textStyle="bold"
-                          android:singleLine="true"/>
+                          android:layout_marginStart="12dp" android:text="Pos --" android:textColor="#FFFFFF"
+                          android:textSize="14sp" android:textStyle="bold" android:singleLine="true"/>
                   </LinearLayout>
                   <TextView android:id="@+id/adx" android:layout_width="match_parent" android:layout_height="wrap_content"
                       android:paddingTop="3dp" android:paddingBottom="3dp"
-                      android:text="ADX --" android:textColor="#DDDDDD" android:textSize="13sp" android:singleLine="true" android:ellipsize="end"/>
-                  <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+                      android:text="ADX --" android:textColor="#DDDDDD" android:textSize="13sp"
+                      android:singleLine="true" android:ellipsize="end"/>
+                  <LinearLayout android:id="@+id/row1" android:layout_width="match_parent" android:layout_height="wrap_content"
                       android:layout_marginTop="2dp" android:orientation="horizontal" android:gravity="center_vertical">
-                      <ImageView android:id="@+id/btnTv" android:layout_width="32dp" android:layout_height="32dp"
-                          android:layout_marginEnd="12dp"/>
-                      <ImageView android:id="@+id/btnDelta" android:layout_width="32dp" android:layout_height="32dp"
-                          android:layout_marginEnd="12dp"/>
-                      <ImageView android:id="@+id/btnTt" android:layout_width="32dp" android:layout_height="32dp"/>
+                      <ImageView android:id="@+id/btn1" android:layout_width="44dp" android:layout_height="44dp"
+                          android:layout_marginEnd="14dp"/>
+                      <ImageView android:id="@+id/btn2" android:layout_width="44dp" android:layout_height="44dp"
+                          android:layout_marginEnd="14dp"/>
+                      <ImageView android:id="@+id/btn3" android:layout_width="44dp" android:layout_height="44dp"/>
+                  </LinearLayout>
+                  <LinearLayout android:id="@+id/row2" android:layout_width="match_parent" android:layout_height="wrap_content"
+                      android:layout_marginTop="6dp" android:orientation="horizontal" android:gravity="center_vertical">
+                      <ImageView android:id="@+id/btn4" android:layout_width="44dp" android:layout_height="44dp"
+                          android:layout_marginEnd="14dp"/>
+                      <ImageView android:id="@+id/btn5" android:layout_width="44dp" android:layout_height="44dp"
+                          android:layout_marginEnd="14dp"/>
+                      <ImageView android:id="@+id/btn6" android:layout_width="44dp" android:layout_height="44dp"/>
                   </LinearLayout>
               </LinearLayout>
           </FrameLayout>
@@ -476,9 +548,9 @@ jobs:
           mkdir -p $(dirname 'app/src/main/res/xml/widget_info.xml')
           cat > 'app/src/main/res/xml/widget_info.xml' <<'END_OF_FILE_X'
           <appwidget-provider xmlns:android="http://schemas.android.com/apk/res/android"
-              android:minWidth="180dp" android:minHeight="90dp"
+              android:minWidth="180dp" android:minHeight="110dp"
               android:minResizeWidth="110dp" android:minResizeHeight="70dp"
-              android:targetCellWidth="3" android:targetCellHeight="2"
+              android:targetCellWidth="3" android:targetCellHeight="3"
               android:updatePeriodMillis="0"
               android:resizeMode="horizontal|vertical"
               android:widgetCategory="home_screen"
