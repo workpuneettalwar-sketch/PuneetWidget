@@ -129,20 +129,46 @@ jobs:
                       c.setRequestProperty("timestamp", ts)
                       c.setRequestProperty("signature", sig)
                   }
-                  val body = (if (c.responseCode in 200..299) c.inputStream else c.errorStream).bufferedReader().readText()
+                  val code = c.responseCode
+                  val body = (if (code in 200..299) c.inputStream else c.errorStream).bufferedReader().readText()
                   c.disconnect()
-                  return JSONObject(body)
+                  val j = try { JSONObject(body) } catch (e: Exception) { throw Exception("HTTP $code") }
+                  if (!j.optBoolean("success", true)) {
+                      val e = j.optJSONObject("error")
+                      throw Exception(e?.optString("code") ?: j.optString("error", "api error"))
+                  }
+                  return j
               }
 
               fun price(): Double =
                   get("/v2/tickers/$SYMBOL", "", null, null).getJSONObject("result").getString("mark_price").toDouble()
 
-              /** Sum of unrealized PnL over all open margined positions. */
-              fun pnl(key: String, secret: String): Double {
+              @Volatile var pnlErr = ""
+
+              /** Live PnL over open positions: size * contract_value * (mark - entry); falls back to unrealized_pnl. */
+              fun pnl(key: String, secret: String): Pair<Double, Int> {
                   val r = get("/v2/positions/margined", "", key, secret).getJSONArray("result")
                   var sum = 0.0
-                  for (i in 0 until r.length()) sum += r.getJSONObject(i).optString("unrealized_pnl", "0").toDoubleOrNull() ?: 0.0
-                  return sum
+                  var count = 0
+                  for (i in 0 until r.length()) {
+                      val p = r.getJSONObject(i)
+                      val size = p.optString("size", "0").toDoubleOrNull() ?: 0.0
+                      if (size == 0.0) continue
+                      count++
+                      val entry = p.optString("entry_price", "").toDoubleOrNull()
+                      val sym = p.optString("product_symbol", "").ifEmpty { p.optJSONObject("product")?.optString("symbol") ?: "" }
+                      var live: Double? = null
+                      if (entry != null && sym.isNotEmpty()) {
+                          try {
+                              val t = get("/v2/tickers/$sym", "", null, null).getJSONObject("result")
+                              val mark = t.optString("mark_price", "").toDoubleOrNull()
+                              val cv = t.optString("contract_value", "1").toDoubleOrNull() ?: 1.0
+                              if (mark != null) live = size * cv * (mark - entry)
+                          } catch (_: Exception) {}
+                      }
+                      sum += live ?: (p.optString("unrealized_pnl", "0").toDoubleOrNull() ?: 0.0)
+                  }
+                  return Pair(sum, count)
               }
 
               fun candles(tf: String): Triple<List<Double>, List<Double>, List<Double>> {
@@ -161,10 +187,13 @@ jobs:
           import android.content.Context
 
           object Prefs {
-              const val DEFAULT_CHART = "https://india.delta.exchange/app/futures/trade/BTC/BTCUSD"
               const val ACTION_CYCLE = "com.btcwidget.CYCLE"
               val TFS = listOf("1m", "3m", "5m", "15m", "30m", "1h", "4h")
               fun sp(c: Context) = c.getSharedPreferences("w", Context.MODE_PRIVATE)
+              fun tfs(c: Context): List<String> {
+                  val l = str(c, "tfs").split(",").map { it.trim() }.filter { it in TFS }.distinct().take(4)
+                  return if (l.isEmpty()) listOf("5m", "15m", "1h") else l
+              }
               fun alpha(c: Context) = sp(c).getInt("alpha", 180)
               fun tf(c: Context) = sp(c).getString("tf", "15m")!!
               fun str(c: Context, k: String) = sp(c).getString(k, "")!!.trim()
@@ -210,6 +239,7 @@ jobs:
                   }
                   field("key", "Delta API key (read-only)")
                   field("secret", "Delta API secret")
+                  field("tfs", "ADX timeframes, comma-separated (blank = 5m,15m,1h; options 1m,3m,5m,15m,30m,1h,4h)")
 
                   fun pick(k: String, title: String) {
                       val btn = Button(this)
@@ -228,13 +258,10 @@ jobs:
                       root.addView(btn)
                   }
                   label("Buttons on the widget open these installed apps")
+                  pick("tvpkg", "TradingView app")
                   pick("dpkg", "Delta Exchange app")
                   pick("tpkg", "Tradetron app")
 
-                  field("chartUrl", "Chart link for the Chart button (blank = default BTCUSD link; falls back to opening the app)")
-                  root.addView(TextView(this).apply {
-                      text = "\nTip: tap the ADX line on the widget to cycle the candle timeframe (1m, 3m, 5m, 15m, 30m, 1h, 4h)."
-                  })
                   setContentView(ScrollView(this).apply { addView(root) })
                   WidgetProvider.start(this)
               }
@@ -263,7 +290,7 @@ jobs:
           import java.util.concurrent.TimeUnit
 
           class UpdateService : Service() {
-              private val pool = Executors.newFixedThreadPool(3)
+              private val pool = Executors.newFixedThreadPool(8)
               private val loop = Executors.newSingleThreadScheduledExecutor()
               private var started = false
 
@@ -304,59 +331,51 @@ jobs:
                   return PendingIntent.getActivity(this, code, i, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
               }
 
-              /** Chart button: deep link into the Delta app if it handles the URL, else just open the app. */
-              private fun chart(pkg: String, url: String): PendingIntent {
-                  var i: Intent? = null
-                  if (pkg.isNotEmpty() && url.isNotEmpty()) {
-                      val v = Intent(Intent.ACTION_VIEW, Uri.parse(url)).setPackage(pkg)
-                      if (packageManager.resolveActivity(v, 0) != null) i = v
-                  }
-                  if (i == null) i = (if (pkg.isNotEmpty()) packageManager.getLaunchIntentForPackage(pkg) else null)
-                      ?: Intent(Intent.ACTION_VIEW, Uri.parse(url.ifEmpty { "https://india.delta.exchange" }))
-                  i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                  return PendingIntent.getActivity(this, 5, i, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
-              }
-
               /** Full update: icons + click targets. Text is refreshed by tick(). */
               private fun initWidget() {
                   val rv = RemoteViews(packageName, R.layout.widget)
-                  val dp = Prefs.str(this, "dpkg"); val tp = Prefs.str(this, "tpkg")
+                  val dp = Prefs.str(this, "dpkg"); val tp = Prefs.str(this, "tpkg"); val tv = Prefs.str(this, "tvpkg")
+                  rv.setImageViewBitmap(R.id.btnTv, icon(tv))
                   rv.setImageViewBitmap(R.id.btnDelta, icon(dp))
                   rv.setImageViewBitmap(R.id.btnTt, icon(tp))
+                  rv.setOnClickPendingIntent(R.id.btnTv, open(6, tv, "https://www.tradingview.com"))
                   rv.setOnClickPendingIntent(R.id.btnDelta, open(1, dp, "https://india.delta.exchange"))
                   rv.setOnClickPendingIntent(R.id.btnTt, open(2, tp, "https://tradetron.tech"))
-                  rv.setOnClickPendingIntent(R.id.btnChart, chart(dp, Prefs.str(this, "chartUrl").ifEmpty { Prefs.DEFAULT_CHART }))
                   rv.setOnClickPendingIntent(R.id.gear, PendingIntent.getActivity(this, 3,
                       Intent(this, SettingsActivity::class.java), PendingIntent.FLAG_IMMUTABLE))
-                  rv.setOnClickPendingIntent(R.id.adx, PendingIntent.getBroadcast(this, 4,
-                      Intent(this, WidgetProvider::class.java).setAction(Prefs.ACTION_CYCLE), PendingIntent.FLAG_IMMUTABLE))
                   AppWidgetManager.getInstance(this).updateAppWidget(ids(), rv)
               }
 
               private fun <T> async(f: () -> T): Future<T?> = pool.submit(Callable<T?> { try { f() } catch (e: Exception) { null } })
 
               private fun tick() {
-                  val tf = Prefs.tf(this)
+                  val tfs = Prefs.tfs(this)
                   val key = Prefs.str(this, "key"); val sec = Prefs.str(this, "secret")
                   val p = async { Delta.price() }
-                  val n = async { if (key.isEmpty()) null else Delta.pnl(key, sec) }
-                  val a = async { val (h, l, c) = Delta.candles(tf); Adx.calc(h, l, c) }
-                  push(tf, p.get(), n.get(), a.get())
+                  val n = async {
+                      if (key.isEmpty() || sec.isEmpty()) { Delta.pnlErr = "add API key in app"; null }
+                      else try { Delta.pnl(key, sec).also { Delta.pnlErr = "" } }
+                      catch (e: Exception) { Delta.pnlErr = e.message ?: e.javaClass.simpleName; null }
+                  }
+                  val a = tfs.map { tf -> async { val (h, l, c) = Delta.candles(tf); Adx.calc(h, l, c)?.first } }
+                  push(p.get(), n.get(), tfs.zip(a.map { it.get() }))
               }
 
-              private fun push(tf: String, price: Double?, pnl: Double?, adx: Triple<Double, Double, Double>?) {
+              private fun push(price: Double?, pnl: Pair<Double, Int>?, adx: List<Pair<String, Double?>>) {
                   val rv = RemoteViews(packageName, R.layout.widget)
                   val L = Locale.US
                   rv.setInt(R.id.bg, "setImageAlpha", Prefs.alpha(this))
                   rv.setTextViewText(R.id.price, if (price == null) "BTC --" else String.format(L, "BTC %,.1f", price))
                   if (pnl == null) {
-                      rv.setTextViewText(R.id.pnl, "PnL --"); rv.setTextColor(R.id.pnl, 0xFFAAAAAA.toInt())
+                      rv.setTextViewText(R.id.pnl, "PnL: " + Delta.pnlErr.ifEmpty { "--" }); rv.setTextColor(R.id.pnl, 0xFFAAAAAA.toInt())
+                      rv.setTextViewText(R.id.pos, "Pos --")
                   } else {
-                      rv.setTextViewText(R.id.pnl, String.format(L, "PnL %+,.2f", pnl))
-                      rv.setTextColor(R.id.pnl, if (pnl >= 0) 0xFF4CD964.toInt() else 0xFFFF5A5F.toInt())
+                      rv.setTextViewText(R.id.pnl, String.format(L, "PnL %+,.2f", pnl.first))
+                      rv.setTextColor(R.id.pnl, if (pnl.first >= 0) 0xFF4CD964.toInt() else 0xFFFF5A5F.toInt())
+                      rv.setTextViewText(R.id.pos, "Pos ${pnl.second}")
                   }
-                  rv.setTextViewText(R.id.adx, if (adx == null) "ADX $tf: --  (tap = timeframe)"
-                      else String.format(L, "ADX %s: %.1f  +DI %.0f  -DI %.0f", tf, adx.first, adx.second, adx.third))
+                  rv.setTextViewText(R.id.adx, "ADX  " + adx.joinToString("  |  ") { (tf, v) ->
+                      if (v == null) "$tf --" else String.format(L, "%s %.1f", tf, v) })
                   AppWidgetManager.getInstance(this).partiallyUpdateAppWidget(ids(), rv)
               }
 
@@ -418,29 +437,34 @@ jobs:
               <ImageView android:id="@+id/bg" android:layout_width="match_parent" android:layout_height="match_parent"
                   android:scaleType="fitXY" android:src="@drawable/bg"/>
               <LinearLayout android:layout_width="match_parent" android:layout_height="match_parent"
-                  android:orientation="vertical" android:padding="10dp">
+                  android:orientation="vertical" android:padding="8dp">
                   <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
                       android:orientation="horizontal" android:gravity="center_vertical">
                       <TextView android:id="@+id/price" android:layout_width="0dp" android:layout_height="wrap_content"
                           android:layout_weight="1" android:text="BTC --" android:textColor="#FFFFFF"
-                          android:textSize="22sp" android:textStyle="bold"/>
+                          android:textSize="20sp" android:textStyle="bold" android:singleLine="true"/>
                       <ImageView android:id="@+id/gear" android:layout_width="24dp" android:layout_height="24dp"
                           android:src="@android:drawable/ic_menu_preferences"/>
                   </LinearLayout>
-                  <TextView android:id="@+id/pnl" android:layout_width="wrap_content" android:layout_height="wrap_content"
-                      android:text="PnL --" android:textColor="#AAAAAA" android:textSize="17sp" android:textStyle="bold"/>
-                  <TextView android:id="@+id/adx" android:layout_width="wrap_content" android:layout_height="wrap_content"
-                      android:text="ADX --" android:textColor="#DDDDDD" android:textSize="14sp"/>
-                  <LinearLayout android:layout_width="match_parent" android:layout_height="0dp" android:layout_weight="1"
+                  <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
                       android:orientation="horizontal" android:gravity="center_vertical">
-                      <ImageView android:id="@+id/btnDelta" android:layout_width="38dp" android:layout_height="38dp"
-                          android:layout_marginEnd="14dp"/>
-                      <ImageView android:id="@+id/btnTt" android:layout_width="38dp" android:layout_height="38dp"
-                          android:layout_marginEnd="14dp"/>
-                      <TextView android:id="@+id/btnChart" android:layout_width="wrap_content" android:layout_height="34dp"
-                          android:background="@drawable/btn_bg" android:gravity="center" android:paddingStart="16dp"
-                          android:paddingEnd="16dp" android:text="Chart" android:textColor="#FFFFFF"
-                          android:textSize="14sp" android:textStyle="bold"/>
+                      <TextView android:id="@+id/pnl" android:layout_width="0dp" android:layout_height="wrap_content"
+                          android:layout_weight="1" android:text="PnL --" android:textColor="#AAAAAA"
+                          android:textSize="16sp" android:textStyle="bold" android:singleLine="true" android:ellipsize="end"/>
+                      <TextView android:id="@+id/pos" android:layout_width="wrap_content" android:layout_height="wrap_content"
+                          android:text="Pos --" android:textColor="#FFFFFF" android:textSize="14sp" android:textStyle="bold"
+                          android:singleLine="true"/>
+                  </LinearLayout>
+                  <TextView android:id="@+id/adx" android:layout_width="match_parent" android:layout_height="wrap_content"
+                      android:paddingTop="3dp" android:paddingBottom="3dp"
+                      android:text="ADX --" android:textColor="#DDDDDD" android:textSize="13sp" android:singleLine="true" android:ellipsize="end"/>
+                  <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+                      android:layout_marginTop="2dp" android:orientation="horizontal" android:gravity="center_vertical">
+                      <ImageView android:id="@+id/btnTv" android:layout_width="32dp" android:layout_height="32dp"
+                          android:layout_marginEnd="12dp"/>
+                      <ImageView android:id="@+id/btnDelta" android:layout_width="32dp" android:layout_height="32dp"
+                          android:layout_marginEnd="12dp"/>
+                      <ImageView android:id="@+id/btnTt" android:layout_width="32dp" android:layout_height="32dp"/>
                   </LinearLayout>
               </LinearLayout>
           </FrameLayout>
@@ -452,7 +476,9 @@ jobs:
           mkdir -p $(dirname 'app/src/main/res/xml/widget_info.xml')
           cat > 'app/src/main/res/xml/widget_info.xml' <<'END_OF_FILE_X'
           <appwidget-provider xmlns:android="http://schemas.android.com/apk/res/android"
-              android:minWidth="250dp" android:minHeight="110dp"
+              android:minWidth="180dp" android:minHeight="90dp"
+              android:minResizeWidth="110dp" android:minResizeHeight="70dp"
+              android:targetCellWidth="3" android:targetCellHeight="2"
               android:updatePeriodMillis="0"
               android:resizeMode="horizontal|vertical"
               android:widgetCategory="home_screen"
