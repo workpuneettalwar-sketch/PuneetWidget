@@ -185,7 +185,7 @@ jobs:
                   val s = spec.trim()
                   when (s.uppercase()) {
                       "ETH" -> return mark("ETHUSD")
-                      "GOLD" -> return bullion("mcx")
+                      "GOLD" -> return bullion("24k")
                       "NIFTY" -> return yahoo("^NSEI")
                   }
                   val low = s.lowercase()
@@ -270,21 +270,31 @@ jobs:
 
               private fun num(o: org.json.JSONObject?, k: String): Double? = o?.optString(k, "")?.toDoubleOrNull()
 
-              /** Own calculation, only used if the exchange does not report unrealized_pnl for a position. */
+              private fun symOf(p: org.json.JSONObject): String =
+                  p.optString("product_symbol", "").ifEmpty { p.optJSONObject("product")?.optString("symbol") ?: "" }
+
+              /** Own calculation: size x contract_value x (mark - entry). Null when any input is missing or implausible. */
               private fun recompute(p: org.json.JSONObject, size: Double): Double? {
                   val entry = num(p, "entry_price") ?: return null
-                  val prod = p.optJSONObject("product")
-                  val sym = p.optString("product_symbol", "").ifEmpty { prod?.optString("symbol") ?: "" }
-                  val cv = num(prod, "contract_value") ?: return null          // never guess a contract size
+                  if (entry <= 0.0) return null                      // an entry of 0 would turn PnL into the position's full value
+                  val sym = symOf(p)
                   if (sym.isEmpty()) return null
-                  val mark = num(get("/v2/tickers/$sym", "", null, null).getJSONObject("result"), "mark_price") ?: return null
+                  val t = get("/v2/tickers/$sym", "", null, null).getJSONObject("result")
+                  val cv = num(p.optJSONObject("product"), "contract_value") ?: num(t, "contract_value") ?: return null
+                  val mark = num(t, "mark_price") ?: return null
                   return size * cv * (mark - entry)
               }
 
-              /**
-               * PnL (USD) and number of open positions.
-               * Uses the exchange's own unrealized_pnl per position, so it stays correct for any size/contract.
-               */
+              /** Delta's own figure is preferred, but only when it agrees with the own calculation; otherwise the own one wins. */
+              private fun pick(api: Double?, own: Double?): Double {
+                  if (api != null && own != null) {
+                      val tol = maxOf(0.5, 0.4 * maxOf(Math.abs(api), Math.abs(own)))
+                      return if (Math.abs(api - own) <= tol) api else own
+                  }
+                  return api ?: own ?: 0.0
+              }
+
+              /** PnL (USD) and number of open positions. */
               fun pnl(key: String, secret: String, relay: String = "", token: String = ""): Pair<Double, Int> {
                   val r = positions(relay, token, key, secret)
                   var sum = 0.0
@@ -294,7 +304,8 @@ jobs:
                       val size = p.optString("size", "0").toDoubleOrNull() ?: 0.0
                       if (size == 0.0) continue
                       count++
-                      sum += num(p, "unrealized_pnl") ?: (try { recompute(p, size) } catch (_: Exception) { null }) ?: 0.0
+                      val own = try { recompute(p, size) } catch (_: Exception) { null }
+                      sum += pick(num(p, "unrealized_pnl"), own)
                   }
                   return Pair(sum, count)
               }
@@ -311,16 +322,15 @@ jobs:
                       open++
                       val api = num(p, "unrealized_pnl")
                       val own = try { recompute(p, size) } catch (e: Exception) { null }
-                      val sym = p.optString("product_symbol", "").ifEmpty { p.optJSONObject("product")?.optString("symbol") ?: "?" }
-                      sb.append("$sym  size=${p.optString("size")}  entry=${p.optString("entry_price")}\n")
+                      val used = pick(api, own)
+                      sb.append("${symOf(p)}  size=${p.optString("size")}  entry=${p.optString("entry_price")}\n")
                       sb.append("  Delta unrealized_pnl: ${api ?: "missing"}\n")
                       sb.append("  own calculation: ${own ?: "n/a"}\n")
-                      sb.append("  contract_value: ${p.optJSONObject("product")?.optString("contract_value") ?: "not in data"}\n")
-                      total += api ?: own ?: 0.0
+                      sb.append("  used: $used   (Rs ${"%.2f".format(used * rate)})\n")
+                      total += used
                   }
                   if (open == 0) return "No open positions."
-                  sb.append("\nTotal (widget uses this): $${"%.4f".format(total)}\n")
-                  sb.append("x rate ${"%.2f".format(rate)} = Rs ${"%.2f".format(total * rate)}\n")
+                  sb.append("\nTotal: $${"%.4f".format(total)}  x ${"%.2f".format(rate)} = Rs ${"%.2f".format(total * rate)}\n")
                   return sb.toString()
               }
 
