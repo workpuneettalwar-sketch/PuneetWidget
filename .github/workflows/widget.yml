@@ -24,7 +24,17 @@ jobs:
           android {
               namespace = "com.btcwidget"
               compileSdk = 34
-              defaultConfig { applicationId = "com.btcwidget"; minSdk = 26; targetSdk = 34; versionCode = 1; versionName = "1.0" }
+              defaultConfig {
+                  applicationId = "com.btcwidget"; minSdk = 26; targetSdk = 34
+                  versionCode = (project.findProperty("verCode") as String?)?.toIntOrNull() ?: 1
+                  versionName = "1.0"
+              }
+              signingConfigs {
+                  getByName("debug") {
+                      storeFile = file("debug.keystore")
+                      storePassword = "android"; keyAlias = "androiddebugkey"; keyPassword = "android"
+                  }
+              }
               compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
               kotlinOptions { jvmTarget = "17" }
           }
@@ -170,20 +180,113 @@ jobs:
                   return v
               }
 
-              fun extra(name: String): Double = when (name) {
-                  "ETH" -> mark("ETHUSD")
-                  "GOLD" -> try { mark("XAUUSD") } catch (e: Exception) { yahoo("GC=F") }
-                  "NIFTY" -> yahoo("^NSEI")
-                  else -> throw Exception("unknown $name")
+              /** spec: ETH | GOLD | NIFTY | delta:SYM | yahoo:SYM | bullions:mcx|24k|22k|silver | bare symbol (auto). */
+              fun priceFor(spec: String): Double {
+                  val s = spec.trim()
+                  when (s.uppercase()) {
+                      "ETH" -> return mark("ETHUSD")
+                      "GOLD" -> return bullion("mcx")
+                      "NIFTY" -> return yahoo("^NSEI")
+                  }
+                  val low = s.lowercase()
+                  if (low.startsWith("bullions:")) return bullion(low.substring(9).trim())
+                  if (low.startsWith("delta:")) return mark(s.substring(6).trim().uppercase())
+                  if (low.startsWith("yahoo:")) return yahoo(s.substring(6).trim())
+                  if (s.any { it in "^=.-" }) return yahoo(s)
+                  return mark(s.uppercase())
               }
+
+              /** Prices from bullions.co.in are in rupees: show without decimals and with a rupee sign. */
+              fun isInr(spec: String): Boolean = spec.trim().equals("GOLD", true) || spec.trim().lowercase().startsWith("bullions:")
+
+              // ---- bullions.co.in (read from the public web page; refreshed at most every 10 s)
+              @Volatile private var bPage: Pair<Long, String>? = null
+              private val numRe = Regex("""\d{1,3}(?:,\d{2,3})+(?:\.\d+)?|\d{4,}(?:\.\d+)?""")
+
+              private class BSpec(val label: Regex, val lo: Double, val hi: Double)
+              private val bspecs = mapOf(
+                  "mcx" to BSpec(Regex("""Gold\W{1,6}India\W{1,4}MCX""", RegexOption.IGNORE_CASE), 30000.0, 1_000_000.0),
+                  "24k" to BSpec(Regex("""Gold\W{1,4}24\W{0,3}(?:Karat|K)""", RegexOption.IGNORE_CASE), 30000.0, 1_000_000.0),
+                  "22k" to BSpec(Regex("""Gold\W{1,4}22\W{0,3}(?:Karat|K)""", RegexOption.IGNORE_CASE), 30000.0, 1_000_000.0),
+                  "silver" to BSpec(Regex("""Silver\W{1,6}India\W{1,4}MCX""", RegexOption.IGNORE_CASE), 30000.0, 5_000_000.0)
+              )
+
+              private fun bullionsText(): String {
+                  val now = System.currentTimeMillis()
+                  bPage?.let { if (now - it.first < 10_000) return it.second }
+                  val c = URL("https://bullions.co.in/").openConnection() as HttpURLConnection
+                  c.connectTimeout = 4000; c.readTimeout = 4000
+                  c.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36")
+                  c.setRequestProperty("Accept", "text/html")
+                  val html = c.inputStream.bufferedReader().readText()
+                  c.disconnect()
+                  val text = html.replace(Regex("(?is)<(script|style)[^>]*>.*?</\\1>"), " ")
+                      .replace(Regex("(?s)<[^>]+>"), " ")
+                      .replace("&nbsp;", " ").replace("&#8377;", " ").replace("&amp;", "&")
+                      .replace(Regex("\\s+"), " ")
+                  bPage = Pair(now, text)
+                  return text
+              }
+
+              private fun bullionsValue(text: String, spec: BSpec): Double? {
+                  for (m in spec.label.findAll(text)) {
+                      val win = text.substring(m.range.last + 1, minOf(text.length, m.range.last + 400))
+                      for (n in numRe.findAll(win)) {
+                          val v = n.value.replace(",", "").toDoubleOrNull() ?: continue
+                          if (v >= spec.lo && v <= spec.hi) return v
+                      }
+                  }
+                  return null
+              }
+
+              fun bullion(kind: String): Double {
+                  val spec = bspecs[kind.lowercase()] ?: throw Exception("unknown bullions:$kind")
+                  return bullionsValue(bullionsText(), spec) ?: throw Exception("not found on bullions.co.in")
+              }
+
+              /** For the "Test gold" button: what was read for each rate, plus the raw text near the label if it failed. */
+              fun bullionsDebug(): String {
+                  val text = bullionsText()
+                  val sb = StringBuilder()
+                  for ((k, spec) in bspecs) {
+                      val v = bullionsValue(text, spec)
+                      sb.append("bullions:$k -> ${v ?: "NOT FOUND"}\n")
+                      if (v == null) {
+                          val m = spec.label.find(text)
+                          sb.append("   text near label: ").append(
+                              if (m == null) "label not on page" else text.substring(m.range.first, minOf(text.length, m.range.last + 160))
+                          ).append("\n")
+                      }
+                  }
+                  return sb.toString()
+              }
+
 
               @Volatile var pnlErr = ""
 
-              /** Live PnL over open positions: size * contract_value * (mark - entry); falls back to unrealized_pnl. */
+              private fun positions(relay: String, token: String, key: String, secret: String) =
+                  (if (relay.isNotEmpty()) get("/positions", "", null, null, relay.trimEnd('/') + "/positions", token)
+                   else get("/v2/positions/margined", "", key, secret)).getJSONArray("result")
+
+              private fun num(o: org.json.JSONObject?, k: String): Double? = o?.optString(k, "")?.toDoubleOrNull()
+
+              /** Own calculation, only used if the exchange does not report unrealized_pnl for a position. */
+              private fun recompute(p: org.json.JSONObject, size: Double): Double? {
+                  val entry = num(p, "entry_price") ?: return null
+                  val prod = p.optJSONObject("product")
+                  val sym = p.optString("product_symbol", "").ifEmpty { prod?.optString("symbol") ?: "" }
+                  val cv = num(prod, "contract_value") ?: return null          // never guess a contract size
+                  if (sym.isEmpty()) return null
+                  val mark = num(get("/v2/tickers/$sym", "", null, null).getJSONObject("result"), "mark_price") ?: return null
+                  return size * cv * (mark - entry)
+              }
+
+              /**
+               * PnL (USD) and number of open positions.
+               * Uses the exchange's own unrealized_pnl per position, so it stays correct for any size/contract.
+               */
               fun pnl(key: String, secret: String, relay: String = "", token: String = ""): Pair<Double, Int> {
-                  val j = if (relay.isNotEmpty()) get("/positions", "", null, null, relay.trimEnd('/') + "/positions", token)
-                          else get("/v2/positions/margined", "", key, secret)
-                  val r = j.getJSONArray("result")
+                  val r = positions(relay, token, key, secret)
                   var sum = 0.0
                   var count = 0
                   for (i in 0 until r.length()) {
@@ -191,20 +294,34 @@ jobs:
                       val size = p.optString("size", "0").toDoubleOrNull() ?: 0.0
                       if (size == 0.0) continue
                       count++
-                      val entry = p.optString("entry_price", "").toDoubleOrNull()
-                      val sym = p.optString("product_symbol", "").ifEmpty { p.optJSONObject("product")?.optString("symbol") ?: "" }
-                      var live: Double? = null
-                      if (entry != null && sym.isNotEmpty()) {
-                          try {
-                              val t = get("/v2/tickers/$sym", "", null, null).getJSONObject("result")
-                              val mark = t.optString("mark_price", "").toDoubleOrNull()
-                              val cv = t.optString("contract_value", "1").toDoubleOrNull() ?: 1.0
-                              if (mark != null) live = size * cv * (mark - entry)
-                          } catch (_: Exception) {}
-                      }
-                      sum += live ?: (p.optString("unrealized_pnl", "0").toDoubleOrNull() ?: 0.0)
+                      sum += num(p, "unrealized_pnl") ?: (try { recompute(p, size) } catch (_: Exception) { null }) ?: 0.0
                   }
                   return Pair(sum, count)
+              }
+
+              /** Human-readable dump used by the "Test PnL" button in settings. */
+              fun pnlDebug(key: String, secret: String, relay: String, token: String, rate: Double): String {
+                  val r = positions(relay, token, key, secret)
+                  val sb = StringBuilder()
+                  var total = 0.0; var open = 0
+                  for (i in 0 until r.length()) {
+                      val p = r.getJSONObject(i)
+                      val size = p.optString("size", "0").toDoubleOrNull() ?: 0.0
+                      if (size == 0.0) continue
+                      open++
+                      val api = num(p, "unrealized_pnl")
+                      val own = try { recompute(p, size) } catch (e: Exception) { null }
+                      val sym = p.optString("product_symbol", "").ifEmpty { p.optJSONObject("product")?.optString("symbol") ?: "?" }
+                      sb.append("$sym  size=${p.optString("size")}  entry=${p.optString("entry_price")}\n")
+                      sb.append("  Delta unrealized_pnl: ${api ?: "missing"}\n")
+                      sb.append("  own calculation: ${own ?: "n/a"}\n")
+                      sb.append("  contract_value: ${p.optJSONObject("product")?.optString("contract_value") ?: "not in data"}\n")
+                      total += api ?: own ?: 0.0
+                  }
+                  if (open == 0) return "No open positions."
+                  sb.append("\nTotal (widget uses this): $${"%.4f".format(total)}\n")
+                  sb.append("x rate ${"%.2f".format(rate)} = Rs ${"%.2f".format(total * rate)}\n")
+                  return sb.toString()
               }
 
               fun candles(tf: String): Triple<List<Double>, List<Double>, List<Double>> {
@@ -232,18 +349,34 @@ jobs:
               fun tsize(c: Context) = sp(c).getInt("tsize", 15)
               fun tf(c: Context) = sp(c).getString("tf", "15m")!!
               fun str(c: Context, k: String) = sp(c).getString(k, "")!!.trim()
-              fun rate(c: Context) = str(c, "rate").toDoubleOrNull() ?: 0.0
+              /** Delta India's fixed USD-INR rate is 85. Blank = 85, type "usd" to show dollars, or any number to override. */
+              fun rate(c: Context): Double {
+                  val v = str(c, "rate")
+                  return when {
+                      v.isEmpty() -> 85.0
+                      v.equals("usd", true) -> 0.0
+                      else -> v.toDoubleOrNull() ?: 85.0
+                  }
+              }
 
               fun tfs(c: Context): List<String> {
                   val l = str(c, "tfs").split(",").map { it.trim() }.filter { it in TFS }.distinct().take(4)
                   return if (l.isEmpty()) listOf("5m", "15m", "1h") else l
               }
 
-              fun extras(c: Context): List<String> {
+              val BUILTIN = listOf("ETH", "GOLD", "NIFTY")
+
+              /** (label, spec) pairs shown under BTC: the built-ins, then up to 3 custom slots. */
+              fun extras(c: Context): List<Pair<String, String>> {
                   val s = str(c, "extras").uppercase()
-                  if (s == "NONE") return emptyList()
-                  val l = s.split(",").map { it.trim() }.filter { it in listOf("ETH", "GOLD", "NIFTY") }.distinct()
-                  return if (l.isEmpty()) listOf("ETH", "GOLD", "NIFTY") else l
+                  val names = if (s == "NONE") emptyList()
+                      else s.split(",").map { it.trim() }.filter { it in BUILTIN }.distinct().ifEmpty { BUILTIN }
+                  val out = names.map { it to it }.toMutableList()
+                  for (i in 1..3) {
+                      val sym = str(c, "c${i}s")
+                      if (sym.isNotEmpty()) out.add(str(c, "c${i}l").ifEmpty { sym.substringAfter(':').uppercase() } to sym)
+                  }
+                  return out
               }
           }
           END_OF_FILE_X
@@ -296,10 +429,46 @@ jobs:
                   field("rtoken", "Relay token")
                   field("key", "Delta API key (read-only; optional backup if relay is down)")
                   field("secret", "Delta API secret (optional backup)")
-                  field("extras", "Extra prices under BTC: ETH, GOLD, NIFTY (comma-separated; blank = all three; none = hide)")
-                  field("rate", "PnL in INR: Delta's fixed USD-to-INR rate (blank = show in $)")
+                  field("extras", "Built-in prices under BTC: ETH, GOLD (rupees, from bullions.co.in), NIFTY (comma-separated; blank = all three; none = hide)")
+                  label("Extra indexes (3 slots): a name and a symbol. Symbols: SOLUSD (Delta), ^NSEBANK ^BSESN ^GSPC SI=F CL=F (Yahoo), " +
+                        "bullions:mcx  bullions:24k  bullions:22k  bullions:silver (rupee rates from bullions.co.in), or delta:/yahoo: prefix")
+                  for (i in 1..3) {
+                      field("c${i}l", "Index $i name (e.g. BANKNIFTY)")
+                      field("c${i}s", "Index $i symbol")
+                  }
+                  field("rate", "USD-to-INR rate for PnL (blank = 85, Delta's fixed rate; type usd to show dollars)")
                   field("tfs", "ADX timeframes, comma-separated (blank = 5m,15m,1h; options 1m,3m,5m,15m,30m,1h,4h)")
 
+                  root.addView(Button(this).apply {
+                      text = "Test PnL (shows raw Delta numbers)"
+                      setOnClickListener {
+                          val relay = Prefs.str(this@SettingsActivity, "relay"); val tok = Prefs.str(this@SettingsActivity, "rtoken")
+                          val key = Prefs.str(this@SettingsActivity, "key"); val sec = Prefs.str(this@SettingsActivity, "secret")
+                          val rate = Prefs.rate(this@SettingsActivity)
+                          Toast.makeText(this@SettingsActivity, "Fetching...", Toast.LENGTH_SHORT).show()
+                          Thread {
+                              val out = try { Delta.pnlDebug(key, sec, relay, tok, if (rate > 0) rate else 85.0) }
+                                        catch (e: Exception) { "Error: " + (e.message ?: e.javaClass.simpleName) }
+                              runOnUiThread {
+                                  AlertDialog.Builder(this@SettingsActivity).setTitle("PnL check").setMessage(out)
+                                      .setPositiveButton("OK", null).show()
+                              }
+                          }.start()
+                      }
+                  })
+                  root.addView(Button(this).apply {
+                      text = "Test gold (bullions.co.in)"
+                      setOnClickListener {
+                          Toast.makeText(this@SettingsActivity, "Fetching...", Toast.LENGTH_SHORT).show()
+                          Thread {
+                              val out = try { Delta.bullionsDebug() } catch (e: Exception) { "Error: " + (e.message ?: e.javaClass.simpleName) }
+                              runOnUiThread {
+                                  AlertDialog.Builder(this@SettingsActivity).setTitle("Gold check").setMessage(out)
+                                      .setPositiveButton("OK", null).show()
+                              }
+                          }.start()
+                      }
+                  })
                   root.addView(Button(this).apply {
                       text = "Open Delta API page (to whitelist an IP)"
                       setOnClickListener {
@@ -447,23 +616,28 @@ jobs:
                   val p = async { Delta.price() }
                   val n = async { fetchPnl(key, sec, relay, rtok) }
                   val a = tfs.map { tf -> async { val (h, l, c) = Delta.candles(tf); Adx.calc(h, l, c)?.first } }
-                  val x = extras.map { name -> async { Delta.extra(name) } }
-                  push(p.get(), n.get(), tfs.zip(a.map { it.get() }), extras.zip(x.map { it.get() }))
+                  val x = extras.map { (_, spec) -> async { Delta.priceFor(spec) } }
+                  push(p.get(), n.get(), tfs.zip(a.map { it.get() }), extras.zip(x.map { it.get() }).map { (e, v) -> Triple(e.first, v, Delta.isInr(e.second)) })
               }
 
               private fun push(price: Double?, pnl: Pair<Double, Int>?, adx: List<Pair<String, Double?>>,
-                               extras: List<Pair<String, Double?>>) {
+                               extras: List<Triple<String, Double?, Boolean>>) {
                   val rv = RemoteViews(packageName, R.layout.widget)
                   val L = Locale.US
                   rv.setInt(R.id.bg, "setImageAlpha", Prefs.alpha(this))
                   val ts = Prefs.tsize(this).toFloat()
-                  for (id in listOf(R.id.more, R.id.pnl, R.id.pos, R.id.adx)) rv.setTextViewTextSize(id, TypedValue.COMPLEX_UNIT_SP, ts)
+                  for (id in listOf(R.id.more, R.id.pos, R.id.adx)) rv.setTextViewTextSize(id, TypedValue.COMPLEX_UNIT_SP, ts)
+                  rv.setTextViewTextSize(R.id.pnl, TypedValue.COMPLEX_UNIT_SP, ts + 2f)
                   rv.setTextViewText(R.id.price, if (price == null) "BTC --" else String.format(L, "BTC %,.1f", price))
                   if (extras.isEmpty()) rv.setViewVisibility(R.id.more, View.GONE)
                   else {
                       rv.setViewVisibility(R.id.more, View.VISIBLE)
-                      rv.setTextViewText(R.id.more, extras.joinToString(" | ") { (n, v) ->
-                          if (v == null) "$n --" else String.format(L, "%s %,.1f", n, v) })
+                      val items = extras.map { (n, v, inr) ->
+                          if (v == null) "$n --"
+                          else if (inr) String.format(L, "%s \u20B9%,.0f", n, v)
+                          else String.format(L, "%s %,.1f", n, v)
+                      }
+                      rv.setTextViewText(R.id.more, items.chunked(3).joinToString("\n") { it.joinToString(" | ") })
                   }
                   if (pnl == null) {
                       rv.setTextViewText(R.id.pnl, "PnL: " + Delta.pnlErr.ifEmpty { "--" }); rv.setTextColor(R.id.pnl, 0xFFAAAAAA.toInt())
@@ -554,8 +728,9 @@ jobs:
                   <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
                       android:orientation="horizontal" android:gravity="center_vertical">
                       <TextView android:id="@+id/pnl" android:layout_width="wrap_content" android:layout_height="wrap_content"
-                          android:text="PnL --" android:textColor="#AAAAAA" android:textSize="15sp"
-                          android:textStyle="bold" android:singleLine="true" android:ellipsize="end"/>
+                          android:text="PnL --" android:textColor="#AAAAAA" android:textSize="17sp"
+                          android:textStyle="bold" android:fontFamily="sans-serif-black"
+                          android:singleLine="true" android:ellipsize="end"/>
                       <TextView android:id="@+id/pos" android:layout_width="wrap_content" android:layout_height="wrap_content"
                           android:layout_marginStart="12dp" android:text="Pos --" android:textColor="#FFFFFF"
                           android:textSize="15sp" android:textStyle="bold" android:singleLine="true"/>
@@ -638,8 +813,56 @@ jobs:
           rootProject.name = "BtcWidget"
           include(":app")
           END_OF_FILE_X
+          base64 -d > app/debug.keystore <<'END_B64'
+          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
+          END_B64
       - name: Build
-        run: cd btc-widget && gradle assembleDebug --no-daemon
+        run: cd btc-widget && gradle assembleDebug -PverCode=${{ github.run_number }} --no-daemon
       - uses: actions/upload-artifact@v4
         with:
           name: btc-widget-apk
