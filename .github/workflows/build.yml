@@ -336,10 +336,10 @@ jobs:
                * "market value instead of PnL" problem). Mode "own" prefers the own calculation.
                */
               private fun pick(api: Double?, own: Double?): Double {
-                  if (pnlMode == "own") return own ?: api ?: 0.0
-                  if (api == null) return own ?: 0.0
-                  if (own == null) return api
-                  return if (Math.abs(api - own) > Math.max(10.0, 5 * Math.abs(own))) own else api
+                  // Delta's unrealized_pnl field turned out to be wrong for option positions, so the own calculation
+                  // (size x contract value x (mark - entry)) is the default. Mode "delta" prefers Delta's field.
+                  if (pnlMode == "delta") return api ?: own ?: 0.0
+                  return own ?: api ?: 0.0
               }
           
               /** Background threads for fetching all option prices at the same time. */
@@ -505,8 +505,8 @@ jobs:
                       field("c${i}l", "Index $i name (e.g. BANKNIFTY)")
                       field("c${i}s", "Index $i symbol")
                   }
-                  field("pnlsrc", "PnL source: blank = Delta's own figure (matches its app); type own to use the widget's own calculation")
-                  field("fee", "Fee per open position in rupees, subtracted from PnL (e.g. 12). Type auto to use Delta's commission figure. Blank = none")
+                  field("pnlsrc", "PnL source: blank = widget calculation (recommended). Type delta to use Delta's own field (known to be wrong for options)")
+                  field("fee", "Fee per open position in rupees, subtracted from PnL. Try 12. Blank = none")
                   field("rate", "USD-to-INR rate for PnL (blank = 85, Delta's fixed rate; type usd to show dollars)")
                   field("tfs", "ADX timeframes, comma-separated (blank = 5m,15m,1h; options 1m,3m,5m,15m,30m,1h,4h)")
           
