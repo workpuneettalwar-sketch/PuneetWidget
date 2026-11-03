@@ -318,7 +318,29 @@ jobs:
               }
           
               /** One consistent source: the live own calculation. Delta's reported figure is only a fallback. */
-              private fun pick(api: Double?, own: Double?): Double = own ?: api ?: 0.0
+              /** Fee setting: "" = none, "auto" = subtract the position's own commission field, number = rupees per open position. */
+              @Volatile var feeMode = ""
+              @Volatile var rateInr = 85.0
+              private fun feeUsd(p: org.json.JSONObject): Double {
+                  if (feeMode.isEmpty()) return 0.0
+                  if (feeMode == "auto") return Math.abs(num(p, "commission") ?: 0.0)
+                  val inr = feeMode.toDoubleOrNull() ?: return 0.0
+                  return inr / (if (rateInr > 0) rateInr else 85.0)
+              }
+          
+              @Volatile var pnlMode = ""   // "" / "delta" = Delta's own figure first, "own" = own calculation first
+          
+              /**
+               * Default: use Delta's own unrealized_pnl (exactly what its app shows, same server, same instant),
+               * but fall back to the own calculation when it is missing or absurdly far from it (guards the old
+               * "market value instead of PnL" problem). Mode "own" prefers the own calculation.
+               */
+              private fun pick(api: Double?, own: Double?): Double {
+                  if (pnlMode == "own") return own ?: api ?: 0.0
+                  if (api == null) return own ?: 0.0
+                  if (own == null) return api
+                  return if (Math.abs(api - own) > Math.max(10.0, 5 * Math.abs(own))) own else api
+              }
           
               /** Background threads for fetching all option prices at the same time. */
               private val fetchPool = java.util.concurrent.Executors.newCachedThreadPool { r -> Thread(r).apply { isDaemon = true } }
@@ -338,7 +360,7 @@ jobs:
                   var sum = 0.0
                   for ((p, _, f) in jobs) {
                       val own = try { f.get(4, java.util.concurrent.TimeUnit.SECONDS) } catch (_: Exception) { null }
-                      sum += pick(num(p, "unrealized_pnl"), own)
+                      sum += pick(num(p, "unrealized_pnl"), own) - feeUsd(p)
                   }
                   return Pair(sum, jobs.size)
               }
@@ -359,8 +381,9 @@ jobs:
                       sb.append("${symOf(p)}  size=${p.optString("size")}  entry=${p.optString("entry_price")}\n")
                       sb.append("  Delta unrealized_pnl: ${api ?: "missing"}\n")
                       sb.append("  own calculation: ${own ?: "n/a"}\n")
-                      sb.append("  used (own calculation first): $used   (Rs ${"%.2f".format(used * rate)})\n")
-                      total += used
+                      sb.append("  commission field: ${p.optString("commission", "missing")}   fee applied: ${"%.4f".format(feeUsd(p))}\n")
+                      sb.append("  used: $used   (Rs ${"%.2f".format(used * rate)})\n")
+                      total += used - feeUsd(p)
                   }
                   if (open == 0) return "No open positions."
                   sb.append("\nTotal: $${"%.4f".format(total)}  x ${"%.2f".format(rate)} = Rs ${"%.2f".format(total * rate)}\n")
@@ -412,9 +435,10 @@ jobs:
           
               /** (label, spec) pairs shown under BTC: the built-ins, then up to 3 custom slots. */
               fun extras(c: Context): List<Pair<String, String>> {
+                  // all six built-ins always show; the field only hides some ("-GIFT,-ETH") or everything ("none")
                   val s = str(c, "extras").uppercase()
-                  val names = if (s == "NONE") emptyList()
-                      else s.split(",").map { it.trim() }.filter { it in BUILTIN }.distinct().ifEmpty { BUILTIN }
+                  val hide = s.split(",").map { it.trim().removePrefix("-") }.toSet()
+                  val names = if (s == "NONE") emptyList() else BUILTIN.filter { it !in hide || !s.contains("-") }
                   val out = names.map { (if (it == "SILVER" || it == "MIDCAP" || it == "GIFT") it.lowercase().replaceFirstChar { c -> c.uppercase() } else it) to it }.toMutableList()
                   for (i in 1..3) {
                       val sym = str(c, "c${i}s")
@@ -474,13 +498,15 @@ jobs:
                   field("rtoken", "Relay token")
                   field("key", "Delta API key (read-only; optional backup if relay is down)")
                   field("secret", "Delta API secret (optional backup)")
-                  field("extras", "Built-in prices under BTC: ETH, GOLD, NIFTY, SILVER, MIDCAP, GIFT (comma-separated; blank = all six; none = hide)")
+                  field("extras", "Built-in prices: blank = all six (ETH GOLD NIFTY SILVER MIDCAP GIFT). To hide some type e.g. -GIFT,-ETH ; type none to hide all")
                   label("Extra indexes (3 slots, shown on a third row): a name and a symbol. Symbols: SOLUSD (Delta), " +
                         "idx:nifty-bank idx:sensex (angelone.in/indices/<name>), bullions:mcx bullions:24k bullions:22k bullions:silver (rupees)")
                   for (i in 1..3) {
                       field("c${i}l", "Index $i name (e.g. BANKNIFTY)")
                       field("c${i}s", "Index $i symbol")
                   }
+                  field("pnlsrc", "PnL source: blank = Delta's own figure (matches its app); type own to use the widget's own calculation")
+                  field("fee", "Fee per open position in rupees, subtracted from PnL (e.g. 12). Type auto to use Delta's commission figure. Blank = none")
                   field("rate", "USD-to-INR rate for PnL (blank = 85, Delta's fixed rate; type usd to show dollars)")
                   field("tfs", "ADX timeframes, comma-separated (blank = 5m,15m,1h; options 1m,3m,5m,15m,30m,1h,4h)")
           
@@ -490,6 +516,7 @@ jobs:
                           val relay = Prefs.str(this@SettingsActivity, "relay"); val tok = Prefs.str(this@SettingsActivity, "rtoken")
                           val key = Prefs.str(this@SettingsActivity, "key"); val sec = Prefs.str(this@SettingsActivity, "secret")
                           val rate = Prefs.rate(this@SettingsActivity)
+                          Delta.feeMode = Prefs.str(this@SettingsActivity, "fee").lowercase(); Delta.rateInr = rate
                           Toast.makeText(this@SettingsActivity, "Fetching...", Toast.LENGTH_SHORT).show()
                           Thread {
                               val out = try { Delta.pnlDebug(key, sec, relay, tok, if (rate > 0) rate else 85.0) }
@@ -656,6 +683,9 @@ jobs:
           
               /** Relay first (fixed IP); if it fails and a direct key is saved, try direct. */
               private fun fetchPnl(key: String, sec: String, relay: String, rtok: String): Pair<Double, Int>? {
+                  Delta.pnlMode = Prefs.str(this, "pnlsrc").lowercase()
+                  Delta.feeMode = Prefs.str(this, "fee").lowercase()
+                  Delta.rateInr = Prefs.rate(this)
                   val direct = key.isNotEmpty() && sec.isNotEmpty()
                   if (relay.isEmpty() && !direct) { Delta.pnlErr = "add relay or API key in app"; return null }
                   try {
@@ -834,32 +864,32 @@ jobs:
                       android:maxLines="2" android:ellipsize="end"/>
                   <LinearLayout android:id="@+id/row1" android:layout_width="match_parent" android:layout_height="wrap_content"
                       android:layout_marginTop="3dp" android:orientation="horizontal" android:gravity="center_vertical">
-                      <ImageView android:id="@+id/btn1" android:layout_width="0dp" android:layout_height="40dp"
+                      <ImageView android:id="@+id/btn1" android:layout_width="0dp" android:layout_height="52dp"
                           android:layout_weight="1" android:padding="3dp"/>
-                      <ImageView android:id="@+id/btn2" android:layout_width="0dp" android:layout_height="40dp"
+                      <ImageView android:id="@+id/btn2" android:layout_width="0dp" android:layout_height="52dp"
                           android:layout_weight="1" android:padding="3dp"/>
-                      <ImageView android:id="@+id/btn3" android:layout_width="0dp" android:layout_height="40dp"
+                      <ImageView android:id="@+id/btn3" android:layout_width="0dp" android:layout_height="52dp"
                           android:layout_weight="1" android:padding="3dp"/>
-                      <ImageView android:id="@+id/btn4" android:layout_width="0dp" android:layout_height="40dp"
+                      <ImageView android:id="@+id/btn4" android:layout_width="0dp" android:layout_height="52dp"
                           android:layout_weight="1" android:padding="3dp"/>
-                      <ImageView android:id="@+id/btn5" android:layout_width="0dp" android:layout_height="40dp"
+                      <ImageView android:id="@+id/btn5" android:layout_width="0dp" android:layout_height="52dp"
                           android:layout_weight="1" android:padding="3dp"/>
-                      <ImageView android:id="@+id/btn6" android:layout_width="0dp" android:layout_height="40dp"
+                      <ImageView android:id="@+id/btn6" android:layout_width="0dp" android:layout_height="52dp"
                           android:layout_weight="1" android:padding="3dp"/>
                   </LinearLayout>
                   <LinearLayout android:id="@+id/row2" android:layout_width="match_parent" android:layout_height="wrap_content"
                       android:layout_marginTop="4dp" android:orientation="horizontal" android:gravity="center_vertical">
-                      <ImageView android:id="@+id/btn7" android:layout_width="0dp" android:layout_height="40dp"
+                      <ImageView android:id="@+id/btn7" android:layout_width="0dp" android:layout_height="52dp"
                           android:layout_weight="1" android:padding="3dp"/>
-                      <ImageView android:id="@+id/btn8" android:layout_width="0dp" android:layout_height="40dp"
+                      <ImageView android:id="@+id/btn8" android:layout_width="0dp" android:layout_height="52dp"
                           android:layout_weight="1" android:padding="3dp"/>
-                      <ImageView android:id="@+id/btn9" android:layout_width="0dp" android:layout_height="40dp"
+                      <ImageView android:id="@+id/btn9" android:layout_width="0dp" android:layout_height="52dp"
                           android:layout_weight="1" android:padding="3dp"/>
-                      <ImageView android:id="@+id/btn10" android:layout_width="0dp" android:layout_height="40dp"
+                      <ImageView android:id="@+id/btn10" android:layout_width="0dp" android:layout_height="52dp"
                           android:layout_weight="1" android:padding="3dp"/>
-                      <ImageView android:id="@+id/btn11" android:layout_width="0dp" android:layout_height="40dp"
+                      <ImageView android:id="@+id/btn11" android:layout_width="0dp" android:layout_height="52dp"
                           android:layout_weight="1" android:padding="3dp"/>
-                      <ImageView android:id="@+id/btn12" android:layout_width="0dp" android:layout_height="40dp"
+                      <ImageView android:id="@+id/btn12" android:layout_width="0dp" android:layout_height="52dp"
                           android:layout_weight="1" android:padding="3dp"/>
                   </LinearLayout>
               </LinearLayout>
@@ -874,9 +904,9 @@ jobs:
           mkdir -p 'app/src/main/res/xml'
           cat > 'app/src/main/res/xml/widget_info.xml' <<'END_OF_FILE_X'
           <appwidget-provider xmlns:android="http://schemas.android.com/apk/res/android"
-              android:minWidth="250dp" android:minHeight="110dp"
+              android:minWidth="250dp" android:minHeight="180dp"
               android:minResizeWidth="110dp" android:minResizeHeight="70dp"
-              android:targetCellWidth="4" android:targetCellHeight="3"
+              android:targetCellWidth="4" android:targetCellHeight="4"
               android:updatePeriodMillis="0"
               android:resizeMode="horizontal|vertical"
               android:widgetCategory="home_screen"
