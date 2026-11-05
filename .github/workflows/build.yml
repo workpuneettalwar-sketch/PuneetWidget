@@ -63,6 +63,8 @@ jobs:
                           <category android:name="android.intent.category.LAUNCHER"/>
                       </intent-filter>
                   </activity>
+                  <activity android:name=".IndexActivity" android:exported="false"
+                      android:theme="@android:style/Theme.DeviceDefault.Dialog" android:label="Indices"/>
                   <receiver android:name=".WidgetProvider" android:exported="true">
                       <intent-filter><action android:name="android.appwidget.action.APPWIDGET_UPDATE"/></intent-filter>
                       <meta-data android:name="android.appwidget.provider" android:resource="@xml/widget_info"/>
@@ -159,8 +161,22 @@ jobs:
                   return j
               }
           
-              fun mark(sym: String): Double =
-                  get("/v2/tickers/$sym", "", null, null).getJSONObject("result").getString("mark_price").toDouble()
+              /** Previous-session reference prices gathered from the sources, keyed by spec (ETH, NIFTY ...). */
+              val prevMap = java.util.concurrent.ConcurrentHashMap<String, Double>()
+              private val tlPrev = ThreadLocal<Double?>()
+              private val dprev = java.util.concurrent.ConcurrentHashMap<String, Double>()
+              private val yprev = java.util.concurrent.ConcurrentHashMap<String, Double>()
+              private val aprev = java.util.concurrent.ConcurrentHashMap<String, Double>()
+              @Volatile private var nsePrev: Map<String, Double> = emptyMap()
+          
+              fun mark(sym: String): Double {
+                  val r = get("/v2/tickers/$sym", "", null, null).getJSONObject("result")
+                  val m = r.getString("mark_price").toDouble()
+                  val pct = r.optString("mark_change_24h", "").toDoubleOrNull()
+                  if (pct != null && pct > -99.0) dprev[sym] = m / (1 + pct / 100.0)
+                  tlPrev.set(dprev[sym])
+                  return m
+              }
           
               fun price(): Double = mark(SYMBOL)
           
@@ -190,9 +206,13 @@ jobs:
           
               fun indexPrice(slug: String): Double {
                   val now = System.currentTimeMillis()
-                  icache[slug]?.let { if (now - it.first < 3000) return it.second }
-                  val v = indexParse(indexText(slug)) ?: throw Exception("price not found for $slug")
+                  icache[slug]?.let { if (now - it.first < 3000) { tlPrev.set(aprev[slug]); return it.second } }
+                  val t = indexText(slug)
+                  val v = indexParse(t) ?: throw Exception("price not found for $slug")
+                  Regex("Previous\\s*Close\\D{0,12}([0-9][0-9,]*\\.?[0-9]*)", RegexOption.IGNORE_CASE).find(t)
+                      ?.groupValues?.get(1)?.replace(",", "")?.toDoubleOrNull()?.let { aprev[slug] = it }
                   icache[slug] = Pair(now, v)
+                  tlPrev.set(aprev[slug])
                   return v
               }
           
@@ -230,17 +250,24 @@ jobs:
                   val body = try { httpGet("https://www.nseindia.com/api/allIndices", nseCookie(), "https://www.nseindia.com/").first }
                              catch (e: Exception) { nseCk = null; throw e }
                   val arr = JSONObject(body).getJSONArray("data")
-                  val m = HashMap<String, Double>()
+                  val m = HashMap<String, Double>(); val pm = HashMap<String, Double>()
                   for (i in 0 until arr.length()) {
                       val o = arr.getJSONObject(i)
                       val v = o.optDouble("last", Double.NaN)
+                      val pc = o.optDouble("previousClose", Double.NaN)
                       if (!v.isNaN()) m[o.optString("index").uppercase()] = v
+                      if (!pc.isNaN() && pc > 0) pm[o.optString("index").uppercase()] = pc
                   }
+                  nsePrev = pm
                   nseData = Pair(now, m)
                   return m
               }
           
-              private fun nseIdx(name: String): Double = nseIndices()[name] ?: throw Exception("$name not in NSE data")
+              private fun nseIdx(name: String): Double {
+                  val v = nseIndices()[name] ?: throw Exception("$name not in NSE data")
+                  tlPrev.set(nsePrev[name])
+                  return v
+              }
           
               private fun nseGift(): Double {
                   val body = try { httpGet("https://www.nseindia.com/api/NextApi/apiClient?functionName=getGiftNifty", nseCookie(), "https://www.nseindia.com/").first }
@@ -254,11 +281,14 @@ jobs:
               private val ycache = java.util.concurrent.ConcurrentHashMap<String, Pair<Long, Double>>()
               fun yahoo(sym: String): Double {
                   val now = System.currentTimeMillis()
-                  ycache[sym]?.let { if (now - it.first < 1000) return it.second }
+                  ycache[sym]?.let { if (now - it.first < 1000) { tlPrev.set(yprev[sym]); return it.second } }
                   val u = "https://query1.finance.yahoo.com/v8/finance/chart/" + java.net.URLEncoder.encode(sym, "UTF-8") + "?interval=1m&range=1d"
                   val body = httpGet(u, null).first
-                  val v = JSONObject(body).getJSONObject("chart").getJSONArray("result").getJSONObject(0)
-                      .getJSONObject("meta").getDouble("regularMarketPrice")
+                  val meta = JSONObject(body).getJSONObject("chart").getJSONArray("result").getJSONObject(0).getJSONObject("meta")
+                  val v = meta.getDouble("regularMarketPrice")
+                  val pc = meta.optDouble("chartPreviousClose", meta.optDouble("previousClose", Double.NaN))
+                  if (!pc.isNaN() && pc > 0) yprev[sym] = pc
+                  tlPrev.set(yprev[sym])
                   ycache[sym] = Pair(now, v)
                   return v
               }
@@ -296,7 +326,13 @@ jobs:
                       val key = spec.uppercase() + ":" + src.first
                       val skip = (badUntil[key] ?: 0L) > System.currentTimeMillis() && i < list.size - 1
                       if (skip) continue
-                      try { return Pair(src.second(), src.first) }
+                      try {
+                          tlPrev.set(null)
+                          val v = src.second()
+                          val pv = tlPrev.get()
+                          if (pv != null) prevMap[spec.uppercase()] = pv else prevMap.remove(spec.uppercase())
+                          return Pair(v, src.first)
+                      }
                       catch (e: Exception) { last = e; badUntil[key] = System.currentTimeMillis() + 30_000 }
                   }
                   throw last ?: Exception("no source for $spec")
@@ -490,6 +526,94 @@ jobs:
           END_OF_FILE_X
 
           mkdir -p 'app/src/main/java/com/btcwidget'
+          cat > 'app/src/main/java/com/btcwidget/IndexActivity.kt' <<'END_OF_FILE_X'
+          package com.btcwidget
+          
+          import android.app.Activity
+          import android.graphics.Color
+          import android.graphics.Typeface
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.view.Gravity
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import java.util.Locale
+          import java.util.concurrent.Executors
+          
+          /** Pop-up opened from the widget's INDICES button: every index with change vs the previous session. */
+          class IndexActivity : Activity() {
+              private val names = listOf(
+                  "Nifty 50" to "NIFTY", "Gold" to "GOLD", "ETH" to "ETH", "Silver" to "SILVER", "Midcap 100" to "MIDCAP",
+                  "Smallcap 100" to "SMALL", "Gift Nifty" to "GIFT", "India VIX" to "VIX", "XAUUSD" to "XAU")
+              private val pool = Executors.newFixedThreadPool(9)
+              private val ui = Handler(Looper.getMainLooper())
+              private val rows = ArrayList<Triple<TextView, TextView, TextView>>()
+              @Volatile private var running = true
+              private var foot: TextView? = null
+          
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  val d = resources.displayMetrics.density
+                  val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding((16 * d).toInt(), (12 * d).toInt(), (16 * d).toInt(), (12 * d).toInt()) }
+                  root.addView(TextView(this).apply { text = "Indices vs previous close"; textSize = 17f; setTypeface(null, Typeface.BOLD) })
+                  for ((label, _) in names) {
+                      val r = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; setPadding(0, (7 * d).toInt(), 0, (7 * d).toInt()) }
+                      val a = TextView(this).apply { text = label; textSize = 15f; setTypeface(null, Typeface.BOLD) }
+                      val p = TextView(this).apply { text = "--"; textSize = 15f; gravity = Gravity.END }
+                      val c = TextView(this).apply { text = ""; textSize = 15f; gravity = Gravity.END; setTypeface(null, Typeface.BOLD) }
+                      r.addView(a, LinearLayout.LayoutParams(0, -2, 1.1f))
+                      r.addView(p, LinearLayout.LayoutParams(0, -2, 1.0f))
+                      r.addView(c, LinearLayout.LayoutParams(0, -2, 1.5f))
+                      root.addView(r)
+                      rows.add(Triple(a, p, c))
+                  }
+                  foot = TextView(this).apply { textSize = 11f; setTextColor(Color.GRAY); setPadding(0, (8 * d).toInt(), 0, 0) }
+                  root.addView(foot)
+                  setContentView(root)
+                  loop()
+              }
+          
+              private fun loop() {
+                  if (!running) return
+                  for ((i, e) in names.withIndex()) {
+                      val spec = e.second
+                      pool.execute {
+                          var price: Double? = null; var prev: Double? = null; var own = false
+                          try {
+                              price = Delta.priceFor(spec)
+                              prev = Delta.prevMap[spec]
+                              val ref = Prefs.refPrev(this, spec, price)
+                              if (prev == null) { prev = ref; own = ref != null }
+                          } catch (_: Exception) {}
+                          val pr = price; val pv = prev; val o = own
+                          ui.post { if (running) show(i, pr, pv, o) }
+                      }
+                  }
+                  ui.postDelayed({ loop() }, 1000)
+              }
+          
+              private fun show(i: Int, price: Double?, prev: Double?, own: Boolean) {
+                  val (_, p, c) = rows[i]
+                  val spec = names[i].second
+                  if (price == null) { p.text = "--"; c.text = ""; return }
+                  val inr = Delta.isInr(spec)
+                  p.text = if (inr) String.format(Locale.US, "₹%,.0f", price)
+                           else if (price >= 10000) String.format(Locale.US, "%,.0f", price) else String.format(Locale.US, "%,.1f", price)
+                  if (prev == null || prev <= 0.0) { c.text = "n/a"; c.setTextColor(Color.GRAY); return }
+                  val diff = price - prev
+                  val pct = diff / prev * 100.0
+                  val pts = if (Math.abs(diff) >= 100) String.format(Locale.US, "%+,.0f", diff) else String.format(Locale.US, "%+,.1f", diff)
+                  c.text = String.format(Locale.US, "%s (%+.2f%%)%s", pts, pct, if (own) "*" else "")
+                  c.setTextColor(if (diff >= 0) Color.rgb(0, 150, 60) else Color.rgb(210, 40, 40))
+                  foot?.text = "* change is vs the widget's own saved close of the previous day"
+              }
+          
+              override fun onDestroy() { running = false; pool.shutdownNow(); super.onDestroy() }
+          }
+          END_OF_FILE_X
+
+          mkdir -p 'app/src/main/java/com/btcwidget'
           cat > 'app/src/main/java/com/btcwidget/Prefs.kt' <<'END_OF_FILE_X'
           package com.btcwidget
           
@@ -536,6 +660,26 @@ jobs:
                       if (sym.isNotEmpty()) out.add(str(c, "c${i}l").ifEmpty { sym.substringAfter(':').uppercase() } to sym)
                   }
                   return out
+              }
+          
+              // ---- own record of the previous day's last price (fallback when a source gives no previous close)
+              private class Ref(var day: String, var last: Double, var prev: Double, var saved: Long)
+              private val refMem = java.util.concurrent.ConcurrentHashMap<String, Ref>()
+          
+              private fun today(): String = java.text.SimpleDateFormat("yyyyMMdd", java.util.Locale.US)
+                  .apply { timeZone = java.util.TimeZone.getTimeZone("Asia/Kolkata") }.format(java.util.Date())
+          
+              fun refPrev(c: Context, spec: String, price: Double): Double? {
+                  val k = spec.uppercase(); val day = today(); val p = sp(c); val now = System.currentTimeMillis()
+                  val st = refMem.getOrPut(k) {
+                      Ref(p.getString("rd_$k", "") ?: "", p.getString("rl_$k", "")?.toDoubleOrNull() ?: 0.0,
+                          p.getString("rp_$k", "")?.toDoubleOrNull() ?: 0.0, 0L)
+                  }
+                  var save = now - st.saved > 30_000
+                  if (st.day != day) { if (st.last > 0) st.prev = st.last; st.day = day; save = true }
+                  st.last = price
+                  if (save) { st.saved = now; p.edit().putString("rd_$k", st.day).putString("rl_$k", st.last.toString()).putString("rp_$k", st.prev.toString()).apply() }
+                  return if (st.prev > 0) st.prev else null
               }
           }
           END_OF_FILE_X
@@ -765,6 +909,8 @@ jobs:
                   }
                   rv.setViewVisibility(R.id.row1, if (pkgs.subList(0, 6).any { it.isNotEmpty() }) View.VISIBLE else View.GONE)
                   rv.setViewVisibility(R.id.row2, if (pkgs.subList(6, 12).any { it.isNotEmpty() }) View.VISIBLE else View.GONE)
+                  rv.setOnClickPendingIntent(R.id.idxbtn, PendingIntent.getActivity(this, 4,
+                      Intent(this, IndexActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK), PendingIntent.FLAG_IMMUTABLE))
                   rv.setOnClickPendingIntent(R.id.gear, PendingIntent.getActivity(this, 3,
                       Intent(this, SettingsActivity::class.java), PendingIntent.FLAG_IMMUTABLE))
                   AppWidgetManager.getInstance(this).updateAppWidget(ids(), rv)
@@ -844,6 +990,7 @@ jobs:
                   val x = extras.map { (_, spec) -> async { Delta.priceFor(spec) } }
                   val items = extras.zip(x.map { it.res() }).map { (e, v) ->
                       val n = e.first
+                      if (v != null) Prefs.refPrev(this, e.second, v)
                       if (v == null) "$n --"
                       else if (Delta.isInr(e.second)) String.format(Locale.US, "%s \u20B9%,.0f", n, v)
                       else if (v >= 10000) String.format(Locale.US, "%s %,.0f", n, v)
@@ -914,6 +1061,15 @@ jobs:
           </shape>
           END_OF_FILE_X
 
+          mkdir -p 'app/src/main/res/drawable'
+          cat > 'app/src/main/res/drawable/idx_btn.xml' <<'END_OF_FILE_X'
+          <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+              <solid android:color="#55FFFFFF"/>
+              <stroke android:width="1dp" android:color="#99FFFFFF"/>
+              <corners android:radius="12dp"/>
+          </shape>
+          END_OF_FILE_X
+
           mkdir -p 'app/src/main/res/layout'
           cat > 'app/src/main/res/layout/widget.xml' <<'END_OF_FILE_X'
           <?xml version="1.0" encoding="utf-8"?>
@@ -952,40 +1108,45 @@ jobs:
                       <TextView android:id="@+id/pos" android:layout_width="wrap_content" android:layout_height="wrap_content"
                           android:layout_marginStart="12dp" android:text="Pos --" android:textColor="#FFFFFF"
                           android:textSize="15sp" android:textStyle="bold" android:singleLine="true"/>
+                      <TextView android:id="@+id/idxbtn" android:layout_width="wrap_content" android:layout_height="wrap_content"
+                          android:layout_marginStart="14dp" android:paddingLeft="12dp" android:paddingRight="12dp"
+                          android:paddingTop="3dp" android:paddingBottom="3dp" android:background="@drawable/idx_btn"
+                          android:text="INDICES" android:textColor="#FFFFFF" android:textSize="12sp" android:textStyle="bold"
+                          android:singleLine="true"/>
                   </LinearLayout>
                   <TextView android:id="@+id/adx" android:layout_width="match_parent" android:layout_height="wrap_content"
                       android:paddingTop="2dp" android:paddingBottom="2dp"
                       android:text="ADX --" android:textColor="#E6EBF0" android:textSize="15sp" android:textStyle="bold"
                       android:maxLines="2" android:ellipsize="end"/>
                   <LinearLayout android:id="@+id/row1" android:layout_width="match_parent" android:layout_height="0dp" android:layout_weight="1"
-                      android:layout_marginTop="3dp" android:orientation="horizontal" android:gravity="center_vertical">
-                      <ImageView android:id="@+id/btn1" android:layout_width="0dp" android:layout_height="match_parent"
-                          android:layout_weight="1" android:padding="3dp" android:scaleType="fitCenter"/>
-                      <ImageView android:id="@+id/btn2" android:layout_width="0dp" android:layout_height="match_parent"
-                          android:layout_weight="1" android:padding="3dp" android:scaleType="fitCenter"/>
-                      <ImageView android:id="@+id/btn3" android:layout_width="0dp" android:layout_height="match_parent"
-                          android:layout_weight="1" android:padding="3dp" android:scaleType="fitCenter"/>
-                      <ImageView android:id="@+id/btn4" android:layout_width="0dp" android:layout_height="match_parent"
-                          android:layout_weight="1" android:padding="3dp" android:scaleType="fitCenter"/>
-                      <ImageView android:id="@+id/btn5" android:layout_width="0dp" android:layout_height="match_parent"
-                          android:layout_weight="1" android:padding="3dp" android:scaleType="fitCenter"/>
-                      <ImageView android:id="@+id/btn6" android:layout_width="0dp" android:layout_height="match_parent"
-                          android:layout_weight="1" android:padding="3dp" android:scaleType="fitCenter"/>
+                      android:layout_marginTop="3dp" android:orientation="horizontal" android:gravity="center">
+                      <ImageView android:id="@+id/btn1" android:layout_width="44dp" android:layout_height="match_parent"
+                          android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
+                      <ImageView android:id="@+id/btn2" android:layout_width="44dp" android:layout_height="match_parent"
+                          android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
+                      <ImageView android:id="@+id/btn3" android:layout_width="44dp" android:layout_height="match_parent"
+                          android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
+                      <ImageView android:id="@+id/btn4" android:layout_width="44dp" android:layout_height="match_parent"
+                          android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
+                      <ImageView android:id="@+id/btn5" android:layout_width="44dp" android:layout_height="match_parent"
+                          android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
+                      <ImageView android:id="@+id/btn6" android:layout_width="44dp" android:layout_height="match_parent"
+                          android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
                   </LinearLayout>
                   <LinearLayout android:id="@+id/row2" android:layout_width="match_parent" android:layout_height="0dp" android:layout_weight="1"
-                      android:layout_marginTop="4dp" android:orientation="horizontal" android:gravity="center_vertical">
-                      <ImageView android:id="@+id/btn7" android:layout_width="0dp" android:layout_height="match_parent"
-                          android:layout_weight="1" android:padding="3dp" android:scaleType="fitCenter"/>
-                      <ImageView android:id="@+id/btn8" android:layout_width="0dp" android:layout_height="match_parent"
-                          android:layout_weight="1" android:padding="3dp" android:scaleType="fitCenter"/>
-                      <ImageView android:id="@+id/btn9" android:layout_width="0dp" android:layout_height="match_parent"
-                          android:layout_weight="1" android:padding="3dp" android:scaleType="fitCenter"/>
-                      <ImageView android:id="@+id/btn10" android:layout_width="0dp" android:layout_height="match_parent"
-                          android:layout_weight="1" android:padding="3dp" android:scaleType="fitCenter"/>
-                      <ImageView android:id="@+id/btn11" android:layout_width="0dp" android:layout_height="match_parent"
-                          android:layout_weight="1" android:padding="3dp" android:scaleType="fitCenter"/>
-                      <ImageView android:id="@+id/btn12" android:layout_width="0dp" android:layout_height="match_parent"
-                          android:layout_weight="1" android:padding="3dp" android:scaleType="fitCenter"/>
+                      android:layout_marginTop="4dp" android:orientation="horizontal" android:gravity="center">
+                      <ImageView android:id="@+id/btn7" android:layout_width="44dp" android:layout_height="match_parent"
+                          android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
+                      <ImageView android:id="@+id/btn8" android:layout_width="44dp" android:layout_height="match_parent"
+                          android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
+                      <ImageView android:id="@+id/btn9" android:layout_width="44dp" android:layout_height="match_parent"
+                          android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
+                      <ImageView android:id="@+id/btn10" android:layout_width="44dp" android:layout_height="match_parent"
+                          android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
+                      <ImageView android:id="@+id/btn11" android:layout_width="44dp" android:layout_height="match_parent"
+                          android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
+                      <ImageView android:id="@+id/btn12" android:layout_width="44dp" android:layout_height="match_parent"
+                          android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
                   </LinearLayout>
               </LinearLayout>
           </FrameLayout>
