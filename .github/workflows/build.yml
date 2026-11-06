@@ -287,17 +287,16 @@ jobs:
                   val res = JSONObject(body).getJSONObject("chart").getJSONArray("result").getJSONObject(0)
                   val meta = res.getJSONObject("meta")
                   val v = meta.getDouble("regularMarketPrice")
-                  // previous close = last daily bar that belongs to an earlier (IST) day than the latest quote
+                  // previous close from daily bars: if the newest bar is the session still in progress (started < 23 h
+                  // before the latest quote), the previous close is the bar before it; otherwise it is the newest bar itself
                   try {
-                      val off = 19800L
                       val rmt = meta.getLong("regularMarketTime")
                       val ts = res.getJSONArray("timestamp")
                       val cl = res.getJSONObject("indicators").getJSONArray("quote").getJSONObject(0).getJSONArray("close")
-                      var prev = Double.NaN
-                      for (i in 0 until ts.length()) {
-                          if ((ts.getLong(i) + off) / 86400 < (rmt + off) / 86400 && !cl.isNull(i)) prev = cl.getDouble(i)
-                      }
-                      if (!prev.isNaN() && prev > 0) yprev[sym] = prev
+                      val last = ts.length() - 1
+                      var i = if (rmt - ts.getLong(last) < 23 * 3600) last - 1 else last
+                      while (i >= 0 && cl.isNull(i)) i--
+                      if (i >= 0) { val pv = cl.getDouble(i); if (pv > 0) yprev[sym] = pv }
                   } catch (_: Exception) {}
                   tlPrev.set(yprev[sym])
                   ycache[sym] = Pair(now, v)
@@ -309,6 +308,9 @@ jobs:
                   val s = spec.trim(); val low = s.lowercase()
                   return when (s.uppercase()) {
                       "BTC" -> listOf("Delta" to { mark("BTCUSD") })
+                      "NASDAQ" -> listOf("Yahoo" to { yahoo("^IXIC") })
+                      "DOW" -> listOf("Yahoo" to { yahoo("^DJI") })
+                      "CRUDE" -> listOf("Yahoo" to { yahoo("CL=F") })
                       "ETH" -> listOf("Delta" to { mark("ETHUSD") })
                       "GOLD" -> listOf("bullions" to { bullion("24k") })
                       "SILVER" -> listOf("bullions" to { bullion("silver") })
@@ -352,13 +354,21 @@ jobs:
           
               fun priceFor(spec: String): Double = quote(spec).first
           
+              /** Previous close from the first source that has one (used when the source that gave the price had none). */
+              fun prevFor(spec: String): Double? {
+                  for ((_, f) in sources(spec)) {
+                      try { tlPrev.set(null); f(); tlPrev.get()?.let { if (it > 0) return it } } catch (_: Exception) {}
+                  }
+                  return null
+              }
+          
               /** For the "Test indices" button: every source of every built-in, tried one by one. */
               fun indexDebug(): String {
                   val sb = StringBuilder()
-                  for (spec in listOf("NIFTY", "GOLD", "ETH", "SILVER", "MIDCAP", "SMALL", "GIFT", "VIX", "XAU")) {
+                  for (spec in listOf("NIFTY", "GOLD", "ETH", "SILVER", "MIDCAP", "SMALL", "GIFT", "VIX", "XAU", "NASDAQ", "DOW", "CRUDE")) {
                       sb.append(spec).append(": ")
                       val parts = sources(spec).map { (n, f) ->
-                          try { "$n=" + "%.1f".format(f()) } catch (e: Exception) { "$n=ERR(" + (e.message ?: e.javaClass.simpleName).take(40) + ")" }
+                          try { tlPrev.set(null); val v = f(); "$n=" + "%.1f".format(v) + (tlPrev.get()?.let { " (prev %.1f)".format(it) } ?: " (no prev)") } catch (e: Exception) { "$n=ERR(" + (e.message ?: e.javaClass.simpleName).take(40) + ")" }
                       }
                       sb.append(parts.joinToString("  ")).append("\n")
                   }
@@ -556,8 +566,9 @@ jobs:
           /** Pop-up opened from the widget's INDICES button: every index with change vs the previous session. */
           class IndexActivity : Activity() {
               private val names = ArrayList<Pair<String, String>>().apply { addAll(listOf(
-                  "BTC" to "BTC", "Nifty 50" to "NIFTY", "Gold" to "GOLD", "ETH" to "ETH", "Silver" to "SILVER", "Midcap 100" to "MIDCAP",
-                  "Smallcap 100" to "SMALL", "Gift Nifty" to "GIFT", "India VIX" to "VIX", "XAUUSD" to "XAU")) }
+                  "Nifty 50" to "NIFTY", "Gift Nifty" to "GIFT", "Midcap 100" to "MIDCAP", "Smallcap 100" to "SMALL", "India VIX" to "VIX",
+                  "BTC" to "BTC", "ETH" to "ETH", "XAUUSD" to "XAU", "Gold" to "GOLD", "Silver" to "SILVER",
+                  "Dow Jones" to "DOW", "Nasdaq" to "NASDAQ", "Crude Oil" to "CRUDE")) }
               private val srcs = java.util.concurrent.ConcurrentHashMap<Int, String>()
               private val pool = Executors.newFixedThreadPool(9)
               private val ui = Handler(Looper.getMainLooper())
@@ -596,7 +607,7 @@ jobs:
                           var price: Double? = null; var prev: Double? = null; var own = false
                           try {
                               val q = Delta.quote(spec); price = q.first; srcs[i] = q.second
-                              prev = Delta.prevMap[spec]
+                              prev = Delta.prevMap[spec] ?: Delta.prevFor(spec)
                               val ref = Prefs.refPrev(this, spec, price)
                               if (prev == null) { prev = ref; own = ref != null }
                           } catch (_: Exception) {}
@@ -1002,8 +1013,7 @@ jobs:
                   val vals = x.map { it.res() }
                   specs.zip(vals).forEach { (sp, v) -> if (v != null) Prefs.refPrev(this, sp, v) }
                   val rv = RemoteViews(packageName, R.layout.widget)
-                  rv.setTextViewTextSize(R.id.nifty, TypedValue.COMPLEX_UNIT_SP, Prefs.tsize(this).toFloat())
-                  rv.setTextViewText(R.id.nifty, vals[0]?.let { String.format(Locale.US, "Nifty %,.0f", it) } ?: "Nifty --")
+                  rv.setTextViewText(R.id.nifty, vals[0]?.let { String.format(Locale.US, "| Nifty %,.0f", it) } ?: "| Nifty --")
                   update(rv)
               }
           
@@ -1085,8 +1095,8 @@ jobs:
                           android:text="BTC --" android:textColor="#FFFFFF"
                           android:textSize="20sp" android:textStyle="bold" android:singleLine="true"/>
                       <TextView android:id="@+id/nifty" android:layout_width="0dp" android:layout_height="wrap_content"
-                          android:layout_weight="1" android:layout_marginStart="12dp" android:text="Nifty --"
-                          android:textColor="#E6EBF0" android:textSize="15sp" android:textStyle="bold" android:singleLine="true"/>
+                          android:layout_weight="1" android:layout_marginStart="8dp" android:text="| Nifty --"
+                          android:textColor="#FFFFFF" android:textSize="20sp" android:textStyle="bold" android:singleLine="true"/>
                       <ImageView android:id="@+id/gear" android:layout_width="24dp" android:layout_height="24dp"
                           android:src="@android:drawable/ic_menu_preferences"/>
                   </LinearLayout>
@@ -1111,33 +1121,33 @@ jobs:
                       android:maxLines="2" android:ellipsize="end"/>
                   <LinearLayout android:id="@+id/row1" android:layout_width="match_parent" android:layout_height="0dp" android:layout_weight="1"
                       android:layout_marginTop="3dp" android:orientation="horizontal" android:gravity="center">
-                      <ImageView android:id="@+id/btn1" android:layout_width="50dp" android:layout_height="match_parent"
-                          android:layout_marginLeft="2dp" android:layout_marginRight="2dp" android:padding="1dp" android:scaleType="fitCenter"/>
-                      <ImageView android:id="@+id/btn2" android:layout_width="50dp" android:layout_height="match_parent"
-                          android:layout_marginLeft="2dp" android:layout_marginRight="2dp" android:padding="1dp" android:scaleType="fitCenter"/>
-                      <ImageView android:id="@+id/btn3" android:layout_width="50dp" android:layout_height="match_parent"
-                          android:layout_marginLeft="2dp" android:layout_marginRight="2dp" android:padding="1dp" android:scaleType="fitCenter"/>
-                      <ImageView android:id="@+id/btn4" android:layout_width="50dp" android:layout_height="match_parent"
-                          android:layout_marginLeft="2dp" android:layout_marginRight="2dp" android:padding="1dp" android:scaleType="fitCenter"/>
-                      <ImageView android:id="@+id/btn5" android:layout_width="50dp" android:layout_height="match_parent"
-                          android:layout_marginLeft="2dp" android:layout_marginRight="2dp" android:padding="1dp" android:scaleType="fitCenter"/>
-                      <ImageView android:id="@+id/btn6" android:layout_width="50dp" android:layout_height="match_parent"
-                          android:layout_marginLeft="2dp" android:layout_marginRight="2dp" android:padding="1dp" android:scaleType="fitCenter"/>
+                      <ImageView android:id="@+id/btn1" android:layout_width="44dp" android:layout_height="match_parent"
+                          android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
+                      <ImageView android:id="@+id/btn2" android:layout_width="44dp" android:layout_height="match_parent"
+                          android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
+                      <ImageView android:id="@+id/btn3" android:layout_width="44dp" android:layout_height="match_parent"
+                          android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
+                      <ImageView android:id="@+id/btn4" android:layout_width="44dp" android:layout_height="match_parent"
+                          android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
+                      <ImageView android:id="@+id/btn5" android:layout_width="44dp" android:layout_height="match_parent"
+                          android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
+                      <ImageView android:id="@+id/btn6" android:layout_width="44dp" android:layout_height="match_parent"
+                          android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
                   </LinearLayout>
                   <LinearLayout android:id="@+id/row2" android:layout_width="match_parent" android:layout_height="0dp" android:layout_weight="1"
                       android:layout_marginTop="4dp" android:orientation="horizontal" android:gravity="center">
-                      <ImageView android:id="@+id/btn7" android:layout_width="50dp" android:layout_height="match_parent"
-                          android:layout_marginLeft="2dp" android:layout_marginRight="2dp" android:padding="1dp" android:scaleType="fitCenter"/>
-                      <ImageView android:id="@+id/btn8" android:layout_width="50dp" android:layout_height="match_parent"
-                          android:layout_marginLeft="2dp" android:layout_marginRight="2dp" android:padding="1dp" android:scaleType="fitCenter"/>
-                      <ImageView android:id="@+id/btn9" android:layout_width="50dp" android:layout_height="match_parent"
-                          android:layout_marginLeft="2dp" android:layout_marginRight="2dp" android:padding="1dp" android:scaleType="fitCenter"/>
-                      <ImageView android:id="@+id/btn10" android:layout_width="50dp" android:layout_height="match_parent"
-                          android:layout_marginLeft="2dp" android:layout_marginRight="2dp" android:padding="1dp" android:scaleType="fitCenter"/>
-                      <ImageView android:id="@+id/btn11" android:layout_width="50dp" android:layout_height="match_parent"
-                          android:layout_marginLeft="2dp" android:layout_marginRight="2dp" android:padding="1dp" android:scaleType="fitCenter"/>
-                      <ImageView android:id="@+id/btn12" android:layout_width="50dp" android:layout_height="match_parent"
-                          android:layout_marginLeft="2dp" android:layout_marginRight="2dp" android:padding="1dp" android:scaleType="fitCenter"/>
+                      <ImageView android:id="@+id/btn7" android:layout_width="44dp" android:layout_height="match_parent"
+                          android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
+                      <ImageView android:id="@+id/btn8" android:layout_width="44dp" android:layout_height="match_parent"
+                          android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
+                      <ImageView android:id="@+id/btn9" android:layout_width="44dp" android:layout_height="match_parent"
+                          android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
+                      <ImageView android:id="@+id/btn10" android:layout_width="44dp" android:layout_height="match_parent"
+                          android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
+                      <ImageView android:id="@+id/btn11" android:layout_width="44dp" android:layout_height="match_parent"
+                          android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
+                      <ImageView android:id="@+id/btn12" android:layout_width="44dp" android:layout_height="match_parent"
+                          android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
                   </LinearLayout>
               </LinearLayout>
           </FrameLayout>
