@@ -68,32 +68,6 @@ jobs:
                       </intent-filter>
                   </activity>
 
-                  <!-- Main profile: invisible step between a widget tap and the Secure Folder app -->
-                  <activity android:name=".LaunchActivity" android:exported="false"
-                      android:theme="@android:style/Theme.Translucent.NoTitleBar"
-                      android:excludeFromRecents="true" android:noHistory="true" android:taskAffinity=""/>
-
-                  <!-- Secure Folder copy: one launcher entry per widget button (hidden in the main profile) -->
-                  <activity android:name=".SlotActivity" android:exported="true"
-                      android:theme="@android:style/Theme.Translucent.NoTitleBar"
-                      android:excludeFromRecents="true" android:noHistory="true" android:taskAffinity=""/>
-                  <activity-alias android:name=".Slot0" android:targetActivity=".SlotActivity" android:exported="true"
-                      android:label="SF Button 1" android:icon="@drawable/ic_app">
-                      <intent-filter><action android:name="android.intent.action.MAIN"/><category android:name="android.intent.category.LAUNCHER"/></intent-filter>
-                  </activity-alias>
-                  <activity-alias android:name=".Slot1" android:targetActivity=".SlotActivity" android:exported="true"
-                      android:label="SF Button 2" android:icon="@drawable/ic_app">
-                      <intent-filter><action android:name="android.intent.action.MAIN"/><category android:name="android.intent.category.LAUNCHER"/></intent-filter>
-                  </activity-alias>
-                  <activity-alias android:name=".Slot2" android:targetActivity=".SlotActivity" android:exported="true"
-                      android:label="SF Button 3" android:icon="@drawable/ic_app">
-                      <intent-filter><action android:name="android.intent.action.MAIN"/><category android:name="android.intent.category.LAUNCHER"/></intent-filter>
-                  </activity-alias>
-                  <activity-alias android:name=".Slot3" android:targetActivity=".SlotActivity" android:exported="true"
-                      android:label="SF Button 4" android:icon="@drawable/ic_app">
-                      <intent-filter><action android:name="android.intent.action.MAIN"/><category android:name="android.intent.category.LAUNCHER"/></intent-filter>
-                  </activity-alias>
-
                   <receiver android:name=".WidgetProvider" android:exported="true">
                       <intent-filter><action android:name="android.appwidget.action.APPWIDGET_UPDATE"/></intent-filter>
                       <meta-data android:name="android.appwidget.provider" android:resource="@xml/widget_info"/>
@@ -106,44 +80,6 @@ jobs:
                   </service>
               </application>
           </manifest>
-          END_OF_FILE_X
-
-          mkdir -p 'app/src/main/java/com/sfwidget'
-          cat > 'app/src/main/java/com/sfwidget/Activities.kt' <<'END_OF_FILE_X'
-          package com.sfwidget
-
-          import android.app.Activity
-          import android.content.Intent
-          import android.os.Bundle
-          import android.widget.Toast
-
-          /** Normal phone: a widget button was pressed. */
-          class LaunchActivity : Activity() {
-              override fun onCreate(b: Bundle?) {
-                  super.onCreate(b)
-                  val slot = intent.getIntExtra("slot", 0).coerceIn(0, 3)
-                  val err = try { Xp.open(this, slot) } catch (e: Exception) { e.message ?: e.javaClass.simpleName }
-                  if (err != null) Toast.makeText(this, err, Toast.LENGTH_LONG).show()
-                  finish()
-              }
-          }
-
-          /** Secure Folder copy: "SF Button 1..4". Opens the app picked for that button inside Secure Folder. */
-          class SlotActivity : Activity() {
-              override fun onCreate(b: Bundle?) {
-                  super.onCreate(b)
-                  val slot = (intent.component?.className ?: "").lastOrNull()?.digitToIntOrNull()?.coerceIn(0, 3) ?: 0
-                  val pkg = Prefs.slotPkg(this, slot)
-                  val launch = if (pkg.isEmpty()) null else packageManager.getLaunchIntentForPackage(pkg)
-                  if (launch != null) {
-                      startActivity(launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-                  } else {
-                      Toast.makeText(this, "Pick the app for button ${slot + 1} in this Secure Folder copy", Toast.LENGTH_LONG).show()
-                      startActivity(Intent(this, SettingsActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-                  }
-                  finish()
-              }
-          }
           END_OF_FILE_X
 
           mkdir -p 'app/src/main/java/com/sfwidget'
@@ -312,8 +248,8 @@ jobs:
                   }
               }
 
-              /** Package name picked for widget button i (0..3); empty = button hidden. */
-              fun slotPkg(c: Context, i: Int) = str(c, "slot$i")
+              /** 0 = normal phone; Secure Folder runs as another Android user (usually 150). */
+              fun inSecureFolder(): Boolean = android.os.Process.myUid() / 100000 != 0
           }
           END_OF_FILE_X
 
@@ -324,110 +260,118 @@ jobs:
           import android.app.Activity
           import android.app.AlertDialog
           import android.content.Intent
+          import android.content.pm.ShortcutInfo
+          import android.content.pm.ShortcutManager
+          import android.graphics.drawable.Icon
           import android.net.Uri
           import android.os.Build
           import android.os.Bundle
           import android.widget.*
+          import androidx.core.graphics.drawable.toBitmap
           import androidx.core.widget.doAfterTextChanged
 
           class SettingsActivity : Activity() {
               override fun onCreate(b: Bundle?) {
                   super.onCreate(b)
-                  if (Build.VERSION.SDK_INT >= 33 && Xp.inMain())
+                  val sf = Prefs.inSecureFolder()
+                  if (Build.VERSION.SDK_INT >= 33 && !sf)
                       requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 1)
                   val sp = Prefs.sp(this)
                   val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(40, 40, 40, 40) }
                   fun label(t: String, big: Boolean = false) = root.addView(TextView(this).apply {
                       text = t; setPadding(0, 32, 0, 0); if (big) { textSize = 18f; setTypeface(typeface, android.graphics.Typeface.BOLD) }
                   })
-                  fun dialog(title: String, work: () -> String) {
-                      Toast.makeText(this, "Checking...", Toast.LENGTH_SHORT).show()
-                      Thread {
-                          val out = try { work() } catch (e: Exception) { "Error: " + (e.message ?: e.javaClass.simpleName) }
-                          runOnUiThread { AlertDialog.Builder(this).setTitle(title).setMessage(out).setPositiveButton("OK", null).show() }
-                      }.start()
-                  }
                   fun button(t: String, f: () -> Unit) = root.addView(Button(this).apply { text = t; setOnClickListener { f() } })
 
-                  label(if (Xp.inMain()) "This copy: NORMAL PHONE (shows the widget)"
-                        else "This copy: SECURE FOLDER (opens apps for the widget buttons)", true)
-
-                  button("Test Secure Folder link") { dialog("Secure Folder link") { Xp.diag(this) } }
-
-                  // ---- app pickers: same as the main widget; the picked app's own icon is shown on the button
-                  label("Widget buttons (2 per row, 2 rows)", true)
-                  label(if (Xp.inMain()) "Pick an app for each button. Apps marked [SF] were seen inside Secure Folder; other apps open their Secure Folder copy when pressed."
-                        else "Secure Folder copy: pick the SAME 4 apps as on the normal phone (used when the widget opens apps through this copy).")
-                  for (i in 0 until 4) {
-                      val btn = Button(this)
-                      fun refresh() { btn.text = "Button ${i + 1}: " + Xp.name(this, Prefs.slotPkg(this, i)) }
-                      refresh()
-                      btn.setOnClickListener {
-                          val pm = packageManager
-                          val names = LinkedHashMap<String, String>()   // package -> name shown in the list
-                          for ((_, a) in Xp.otherApps(this))
-                              names.putIfAbsent(a.componentName.packageName, "[SF] " + a.label)
-                          for (r in pm.queryIntentActivities(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), 0)) {
-                              val p = r.activityInfo.packageName
-                              if (p != packageName) names.putIfAbsent(p, r.loadLabel(pm).toString())
-                          }
-                          val list = names.entries.sortedBy { it.value.removePrefix("[SF] ").lowercase() }
-                          AlertDialog.Builder(this).setTitle("Button ${i + 1}")
-                              .setItems((listOf("None (empty slot)") + list.map { it.value }).toTypedArray()) { _, k ->
-                                  sp.edit().putString("slot$i", if (k == 0) "" else list[k - 1].key).apply()
-                                  refresh(); WidgetProvider.start(this)
-                              }.show()
-                      }
-                      root.addView(btn)
-                  }
-
-                  fun field(k: String, hint: String) {
-                      label(hint)
-                      root.addView(EditText(this).apply {
-                          setText(sp.getString(k, "")); setSingleLine()
-                          doAfterTextChanged { sp.edit().putString(k, it.toString().trim()).apply() }
-                      })
-                  }
-
-                  // ---- widget side
-                  label("PnL (2nd Delta account)", true)
-                  if (!Xp.inMain()) label("These matter only in the normal-phone copy, where the widget is.")
-                  fun seek(title: String, maxV: Int, init: Int, save: (Int) -> Unit) {
-                      label(title)
-                      root.addView(SeekBar(this).apply {
-                          max = maxV; progress = init
-                          setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                              override fun onProgressChanged(s: SeekBar?, p: Int, u: Boolean) { save(p) }
-                              override fun onStartTrackingTouch(s: SeekBar?) {}
-                              override fun onStopTrackingTouch(s: SeekBar?) {}
+                  if (sf) {
+                      // ---- Secure Folder copy: put Secure Folder apps on the normal home screen, each opening directly
+                      label("Secure Folder app buttons", true)
+                      label("Tap the button below, pick a Secure Folder app (Tradetron, Delta, Authenticator...) and confirm \"Add\". " +
+                            "Its icon appears on your normal home screen and opens that app inside Secure Folder directly. " +
+                            "Place the 3 icons in a row right under the PnL widget.")
+                      button("Add a Secure Folder app to home screen") { pickAndPin() }
+                  } else {
+                      // ---- normal phone copy: the PnL widget
+                      label("PnL widget (2nd Delta account)", true)
+                      label("For the app buttons, open this same app INSIDE Secure Folder and use \"Add a Secure Folder app to home screen\".")
+                      fun seek(title: String, maxV: Int, init: Int, save: (Int) -> Unit) {
+                          label(title)
+                          root.addView(SeekBar(this).apply {
+                              max = maxV; progress = init
+                              setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                                  override fun onProgressChanged(s: SeekBar?, p: Int, u: Boolean) { save(p) }
+                                  override fun onStartTrackingTouch(s: SeekBar?) {}
+                                  override fun onStopTrackingTouch(s: SeekBar?) {}
+                              })
                           })
-                      })
-                  }
-                  seek("Widget transparency (left = clear, right = solid)", 255, Prefs.alpha(this)) { sp.edit().putInt("alpha", it).apply() }
-                  seek("Text size for PnL and Pos (11-22)", 11, Prefs.tsize(this) - 11) { sp.edit().putInt("tsize", it + 11).apply() }
-                  field("key", "Delta API key of the 2nd account (read-only key is enough)")
-                  field("secret", "Delta API secret of the 2nd account")
-                  field("relay", "Relay URL (optional, fixed-IP server). Must be set up for the 2nd account's key")
-                  field("rtoken", "Relay token (optional)")
-                  field("pnlsrc", "PnL source: blank = widget calculation (recommended). Type delta to use Delta's own field")
-                  field("fee", "Fee per open position in rupees, subtracted from PnL. Blank = none")
-                  field("rate", "USD-to-INR rate (blank = 85, Delta's fixed rate; type usd to show dollars)")
-
-                  button("Test PnL (shows raw Delta numbers)") {
-                      val rate = Prefs.rate(this)
-                      Delta.feeMode = Prefs.str(this, "fee").lowercase(); Delta.rateInr = rate
-                      Delta.pnlMode = Prefs.str(this, "pnlsrc").lowercase()
-                      dialog("PnL check") {
-                          Delta.pnlDebug(Prefs.str(this, "key"), Prefs.str(this, "secret"), Prefs.str(this, "relay"),
-                              Prefs.str(this, "rtoken"), if (rate > 0) rate else 85.0)
                       }
-                  }
-                  button("Open Delta API page (to whitelist an IP)") {
-                      startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://india.delta.exchange/app/account/manageapikeys")))
+                      fun field(k: String, hint: String) {
+                          label(hint)
+                          root.addView(EditText(this).apply {
+                              setText(sp.getString(k, "")); setSingleLine()
+                              doAfterTextChanged { sp.edit().putString(k, it.toString().trim()).apply() }
+                          })
+                      }
+                      seek("Widget transparency (left = clear, right = solid)", 255, Prefs.alpha(this)) { sp.edit().putInt("alpha", it).apply() }
+                      seek("Text size for PnL and Pos (11-22)", 11, Prefs.tsize(this) - 11) { sp.edit().putInt("tsize", it + 11).apply() }
+                      field("key", "Delta API key of the 2nd account (read-only key is enough)")
+                      field("secret", "Delta API secret of the 2nd account")
+                      field("relay", "Relay URL (optional, fixed-IP server). Must be set up for the 2nd account's key")
+                      field("rtoken", "Relay token (optional)")
+                      field("pnlsrc", "PnL source: blank = widget calculation (recommended). Type delta to use Delta's own field")
+                      field("fee", "Fee per open position in rupees, subtracted from PnL. Blank = none")
+                      field("rate", "USD-to-INR rate (blank = 85, Delta's fixed rate; type usd to show dollars)")
+
+                      button("Test PnL (shows raw Delta numbers)") {
+                          val rate = Prefs.rate(this)
+                          Delta.feeMode = Prefs.str(this, "fee").lowercase(); Delta.rateInr = rate
+                          Delta.pnlMode = Prefs.str(this, "pnlsrc").lowercase()
+                          Toast.makeText(this, "Checking...", Toast.LENGTH_SHORT).show()
+                          Thread {
+                              val out = try {
+                                  Delta.pnlDebug(Prefs.str(this, "key"), Prefs.str(this, "secret"), Prefs.str(this, "relay"),
+                                      Prefs.str(this, "rtoken"), if (rate > 0) rate else 85.0)
+                              } catch (e: Exception) { "Error: " + (e.message ?: e.javaClass.simpleName) }
+                              runOnUiThread { AlertDialog.Builder(this).setTitle("PnL check").setMessage(out).setPositiveButton("OK", null).show() }
+                          }.start()
+                      }
+                      button("Open Delta API page (to whitelist an IP)") {
+                          startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://india.delta.exchange/app/account/manageapikeys")))
+                      }
                   }
 
                   setContentView(ScrollView(this).apply { addView(root) })
                   WidgetProvider.start(this)
+              }
+
+              /** Secure Folder copy: choose an app of this profile and ask the system to pin its shortcut on the home screen. */
+              private fun pickAndPin() {
+                  val sm = getSystemService(ShortcutManager::class.java)
+                  if (sm == null || !sm.isRequestPinShortcutSupported) {
+                      AlertDialog.Builder(this).setTitle("Not supported")
+                          .setMessage("This phone does not allow adding shortcuts from here.").setPositiveButton("OK", null).show()
+                      return
+                  }
+                  val pm = packageManager
+                  val apps = pm.queryIntentActivities(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), 0)
+                      .filter { it.activityInfo.packageName != packageName }
+                      .sortedBy { it.loadLabel(pm).toString().lowercase() }
+                  AlertDialog.Builder(this).setTitle("Secure Folder app")
+                      .setItems(apps.map { it.loadLabel(pm).toString() }.toTypedArray()) { _, k ->
+                          val a = apps[k].activityInfo
+                          val name = apps[k].loadLabel(pm).toString()
+                          val launch = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+                              .setClassName(a.packageName, a.name)
+                              .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED)
+                          val icon = Icon.createWithBitmap(apps[k].loadIcon(pm).toBitmap(192, 192))
+                          val info = ShortcutInfo.Builder(this, "sf_" + a.packageName)
+                              .setShortLabel(name.take(12)).setLongLabel(name).setIcon(icon).setIntent(launch).build()
+                          try {
+                              sm.requestPinShortcut(info, null)
+                          } catch (e: Exception) {
+                              Toast.makeText(this, "Could not add: " + (e.message ?: e.javaClass.simpleName), Toast.LENGTH_LONG).show()
+                          }
+                      }.show()
               }
 
               override fun onPause() { super.onPause(); WidgetProvider.start(this) }
@@ -443,13 +387,10 @@ jobs:
           import android.content.ComponentName
           import android.content.Intent
           import android.content.pm.ServiceInfo
-          import android.net.Uri
           import android.os.Build
           import android.os.IBinder
           import android.util.TypedValue
-          import android.view.View
           import android.widget.RemoteViews
-          import androidx.core.graphics.drawable.toBitmap
           import java.util.Locale
           import java.util.concurrent.Executors
           import java.util.concurrent.TimeUnit
@@ -457,8 +398,6 @@ jobs:
           class UpdateService : Service() {
               private val loop = Executors.newSingleThreadScheduledExecutor()
               private var started = false
-
-              private val btnIds = listOf(R.id.b0, R.id.b1, R.id.b2, R.id.b3)
 
               override fun onBind(i: Intent?): IBinder? = null
 
@@ -484,22 +423,9 @@ jobs:
               private fun ids() = AppWidgetManager.getInstance(this)
                   .getAppWidgetIds(ComponentName(this, WidgetProvider::class.java))
 
-              /** Full update: icons, labels and click targets. Text is refreshed by tick(). */
+              /** Full update: click target of the gear. Text is refreshed by tick(). */
               private fun initWidget() {
                   val rv = RemoteViews(packageName, R.layout.widget)
-                  val pkgs = (0 until 4).map { Prefs.slotPkg(this, it) }
-                  for (i in 0 until 4) {
-                      if (pkgs[i].isEmpty()) { rv.setViewVisibility(btnIds[i], View.INVISIBLE); continue }
-                      rv.setViewVisibility(btnIds[i], View.VISIBLE)
-                      rv.setImageViewBitmap(btnIds[i], Xp.icon(this, pkgs[i]).toBitmap(96, 96))
-                      val tap = Intent(this, LaunchActivity::class.java).putExtra("slot", i)
-                          .setData(Uri.parse("sfw://slot/$i"))
-                          .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_NO_ANIMATION)
-                      rv.setOnClickPendingIntent(btnIds[i], PendingIntent.getActivity(this, 20 + i, tap,
-                          PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT))
-                  }
-                  rv.setViewVisibility(R.id.row1, if (pkgs[0].isNotEmpty() || pkgs[1].isNotEmpty()) View.VISIBLE else View.GONE)
-                  rv.setViewVisibility(R.id.row2, if (pkgs[2].isNotEmpty() || pkgs[3].isNotEmpty()) View.VISIBLE else View.GONE)
                   rv.setOnClickPendingIntent(R.id.gear, PendingIntent.getActivity(this, 3,
                       Intent(this, SettingsActivity::class.java), PendingIntent.FLAG_IMMUTABLE))
                   AppWidgetManager.getInstance(this).updateAppWidget(ids(), rv)
@@ -575,7 +501,6 @@ jobs:
 
                   /** The refresh service runs only where a widget is actually placed (not in the Secure Folder copy). */
                   fun start(c: Context) {
-                      Xp.syncAliases(c)
                       if (!hasWidget(c)) return
                       try { c.startForegroundService(Intent(c, UpdateService::class.java)) } catch (_: Exception) {}
                   }
@@ -584,127 +509,6 @@ jobs:
 
           class BootReceiver : BroadcastReceiver() {
               override fun onReceive(c: Context, i: Intent) = WidgetProvider.start(c)
-          }
-          END_OF_FILE_X
-
-          mkdir -p 'app/src/main/java/com/sfwidget'
-          cat > 'app/src/main/java/com/sfwidget/Xp.kt' <<'END_OF_FILE_X'
-          package com.sfwidget
-
-          import android.app.Activity
-          import android.content.ComponentName
-          import android.content.Context
-          import android.content.Intent
-          import android.content.pm.CrossProfileApps
-          import android.content.pm.LauncherActivityInfo
-          import android.content.pm.LauncherApps
-          import android.content.pm.PackageManager
-          import android.graphics.drawable.Drawable
-          import android.os.Build
-          import android.os.Process
-          import android.os.UserHandle
-
-          /** Opening apps that live in Secure Folder (a separate Android profile) from the home-screen widget. */
-          object Xp {
-              private const val SF_PKG = "com.samsung.knox.securefolder"
-
-              /** 0 = normal phone profile; Secure Folder runs as another user (usually 150). */
-              fun userId(): Int = Process.myUid() / 100000
-              fun inMain(): Boolean = userId() == 0
-
-              fun slotComponent(c: Context, i: Int) = ComponentName(c.packageName, "com.sfwidget.Slot$i")
-
-              /** The 4 "SF Button" launcher entries are needed only in the Secure Folder copy; hide them on the normal phone. */
-              fun syncAliases(c: Context) {
-                  val state = if (inMain()) PackageManager.COMPONENT_ENABLED_STATE_DISABLED
-                              else PackageManager.COMPONENT_ENABLED_STATE_ENABLED
-                  for (i in 0 until 4) try {
-                      c.packageManager.setComponentEnabledSetting(slotComponent(c, i), state, PackageManager.DONT_KILL_APP)
-                  } catch (_: Exception) {}
-              }
-
-              fun otherProfiles(c: Context): List<UserHandle> = try {
-                  c.getSystemService(LauncherApps::class.java).profiles.filter { it != Process.myUserHandle() }
-              } catch (_: Exception) { emptyList() }
-
-              /** Apps of Secure Folder, when the system lets this app see them (empty otherwise). */
-              fun otherApps(c: Context): List<Pair<UserHandle, LauncherActivityInfo>> {
-                  val la = c.getSystemService(LauncherApps::class.java)
-                  return otherProfiles(c).flatMap { u ->
-                      try { la.getActivityList(null, u).map { u to it } } catch (_: Exception) { emptyList() }
-                  }.filter { it.second.componentName.packageName != c.packageName }
-              }
-
-              private fun twinProfiles(c: Context): List<UserHandle> =
-                  if (Build.VERSION.SDK_INT >= 28) try { c.getSystemService(CrossProfileApps::class.java).targetUserProfiles }
-                  catch (_: Exception) { emptyList() } else emptyList()
-
-              /** Icon for a picked package: the Secure Folder app's own icon if visible, else the normal-phone install's icon. */
-              fun icon(c: Context, pkg: String): Drawable {
-                  otherApps(c).firstOrNull { it.second.componentName.packageName == pkg }?.let {
-                      try { return it.second.getIcon(0) } catch (_: Exception) {}
-                  }
-                  return try { c.packageManager.getApplicationIcon(pkg) }
-                  catch (_: Exception) { c.getDrawable(android.R.drawable.sym_def_app_icon)!! }
-              }
-
-              /** Name of a picked package, from Secure Folder or the normal phone. */
-              fun name(c: Context, pkg: String): String {
-                  if (pkg.isEmpty()) return "empty"
-                  otherApps(c).firstOrNull { it.second.componentName.packageName == pkg }?.let { return it.second.label.toString() }
-                  return try { c.packageManager.getApplicationLabel(c.packageManager.getApplicationInfo(pkg, 0)).toString() }
-                  catch (_: Exception) { pkg }
-              }
-
-              /**
-               * Called from the widget tap (normal phone). Tries, in order:
-               * 1. Direct: the system lets us see Secure Folder's apps -> start the picked app there.
-               * 2. Twin: this same app is installed inside Secure Folder -> start its "SF Button" entry, which opens the app.
-               * 3. Fallback: open Secure Folder itself.
-               * Returns a message only when it could not open the app.
-               */
-              fun open(a: Activity, i: Int): String? {
-                  val pkg = Prefs.slotPkg(a, i)
-                  val la = a.getSystemService(LauncherApps::class.java)
-                  otherApps(a).firstOrNull { it.second.componentName.packageName == pkg }?.let { (u, info) ->
-                      try { la.startMainActivity(info.componentName, u, null, null); return null } catch (_: Exception) {}
-                  }
-                  if (Build.VERSION.SDK_INT >= 28) {
-                      val cpa = a.getSystemService(CrossProfileApps::class.java)
-                      for (u in twinProfiles(a)) {
-                          try { cpa.startMainActivity(slotComponent(a, i), u); return null } catch (_: Exception) {}
-                      }
-                  }
-                  val sf = a.packageManager.getLaunchIntentForPackage(SF_PKG)
-                  if (sf != null) {
-                      a.startActivity(sf.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-                      return "Could not reach the app in Secure Folder directly. Install Secure Folder Widget inside Secure Folder too."
-                  }
-                  return "Secure Folder not found"
-              }
-
-              /** For the "Test Secure Folder link" button. */
-              fun diag(c: Context): String {
-                  val sb = StringBuilder()
-                  sb.append("This copy runs in: ").append(if (inMain()) "normal phone (user 0)" else "Secure Folder (user ${userId()})").append("\n\n")
-                  val apps = otherApps(c)
-                  sb.append("Direct way - other profiles visible: ${otherProfiles(c).size}, apps seen there: ${apps.size}\n")
-                  for (i in 0 until 4) {
-                      val pkg = Prefs.slotPkg(c, i)
-                      if (pkg.isEmpty()) continue
-                      val seen = apps.any { it.second.componentName.packageName == pkg }
-                      sb.append("  Button ${i + 1} ${name(c, pkg)}: ${if (seen) "found in Secure Folder" else "not seen"}\n")
-                  }
-                  val tp = twinProfiles(c)
-                  sb.append("\nTwin way - profiles with this app installed: ${tp.size}\n\n")
-                  sb.append(when {
-                      !inMain() -> "This is the Secure Folder copy. Pick the same 4 apps here (needed only for the twin way)."
-                      apps.isNotEmpty() -> "OK: buttons open Secure Folder apps directly."
-                      tp.isNotEmpty() -> "OK: buttons go through the copy inside Secure Folder. Pick the same 4 apps in that copy."
-                      else -> "Not linked yet. Install this same APK inside Secure Folder, open it there once, pick the apps, then test again."
-                  })
-                  return sb.toString()
-              }
           }
           END_OF_FILE_X
 
@@ -735,33 +539,18 @@ jobs:
               <ImageView android:id="@+id/bg" android:layout_width="match_parent" android:layout_height="match_parent"
                   android:scaleType="fitXY" android:src="@drawable/bg"/>
               <LinearLayout android:layout_width="match_parent" android:layout_height="match_parent"
-                  android:orientation="vertical" android:padding="8dp">
-                  <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
-                      android:orientation="horizontal" android:gravity="center_vertical">
-                      <TextView android:id="@+id/pnl" android:layout_width="0dp" android:layout_weight="1" android:layout_height="wrap_content"
-                          android:text="PnL --" android:textColor="#AAAAAA" android:textSize="18sp"
-                          android:textStyle="bold" android:fontFamily="sans-serif-black"
-                          android:singleLine="true" android:ellipsize="end"/>
-                      <TextView android:id="@+id/pos" android:layout_width="wrap_content" android:layout_height="wrap_content"
-                          android:layout_marginStart="10dp" android:layout_marginEnd="8dp" android:text="Pos --" android:textColor="#FFFFFF"
-                          android:textSize="16sp" android:textStyle="bold" android:singleLine="true"/>
-                      <ImageView android:id="@+id/gear" android:layout_width="22dp" android:layout_height="22dp"
-                          android:src="@android:drawable/ic_menu_preferences"/>
-                  </LinearLayout>
-                  <LinearLayout android:id="@+id/row1" android:layout_width="match_parent" android:layout_height="0dp" android:layout_weight="1"
-                      android:layout_marginTop="3dp" android:orientation="horizontal" android:gravity="center">
-                      <ImageView android:id="@+id/b0" android:layout_width="44dp" android:layout_height="match_parent"
-                          android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
-                      <ImageView android:id="@+id/b1" android:layout_width="44dp" android:layout_height="match_parent"
-                          android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
-                  </LinearLayout>
-                  <LinearLayout android:id="@+id/row2" android:layout_width="match_parent" android:layout_height="0dp" android:layout_weight="1"
-                      android:layout_marginTop="4dp" android:orientation="horizontal" android:gravity="center">
-                      <ImageView android:id="@+id/b2" android:layout_width="44dp" android:layout_height="match_parent"
-                          android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
-                      <ImageView android:id="@+id/b3" android:layout_width="44dp" android:layout_height="match_parent"
-                          android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
-                  </LinearLayout>
+                  android:orientation="horizontal" android:gravity="center_vertical"
+                  android:paddingLeft="10dp" android:paddingRight="6dp" android:paddingTop="4dp" android:paddingBottom="4dp">
+                  <TextView android:id="@+id/pnl" android:layout_width="wrap_content" android:layout_height="wrap_content"
+                      android:text="PnL --" android:textColor="#AAAAAA" android:textSize="18sp"
+                      android:textStyle="bold" android:fontFamily="sans-serif-black"
+                      android:singleLine="true" android:ellipsize="end"/>
+                  <TextView android:id="@+id/pos" android:layout_width="wrap_content" android:layout_height="wrap_content"
+                      android:layout_marginStart="6dp" android:text="Pos --" android:textColor="#FFFFFF"
+                      android:textSize="16sp" android:textStyle="bold" android:singleLine="true"/>
+                  <View android:layout_width="0dp" android:layout_height="1dp" android:layout_weight="1"/>
+                  <ImageView android:id="@+id/gear" android:layout_width="20dp" android:layout_height="20dp"
+                      android:layout_marginStart="4dp" android:src="@android:drawable/ic_menu_preferences"/>
               </LinearLayout>
           </FrameLayout>
           END_OF_FILE_X
@@ -774,9 +563,9 @@ jobs:
           mkdir -p 'app/src/main/res/xml'
           cat > 'app/src/main/res/xml/widget_info.xml' <<'END_OF_FILE_X'
           <appwidget-provider xmlns:android="http://schemas.android.com/apk/res/android"
-              android:minWidth="140dp" android:minHeight="110dp"
-              android:minResizeWidth="110dp" android:minResizeHeight="60dp"
-              android:targetCellWidth="3" android:targetCellHeight="2"
+              android:minWidth="110dp" android:minHeight="40dp"
+              android:minResizeWidth="110dp" android:minResizeHeight="40dp"
+              android:targetCellWidth="3" android:targetCellHeight="1"
               android:updatePeriodMillis="0"
               android:resizeMode="horizontal|vertical"
               android:widgetCategory="home_screen"
