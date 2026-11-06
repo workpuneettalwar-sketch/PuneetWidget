@@ -548,7 +548,7 @@ jobs:
                   <TextView android:id="@+id/pos" android:layout_width="wrap_content" android:layout_height="wrap_content"
                       android:layout_marginStart="6dp" android:text="Pos --" android:textColor="#FFFFFF"
                       android:textSize="16sp" android:textStyle="bold" android:singleLine="true"/>
-                  <View android:layout_width="0dp" android:layout_height="1dp" android:layout_weight="1"/>
+                  <FrameLayout android:layout_width="0dp" android:layout_height="1dp" android:layout_weight="1"/>
                   <ImageView android:id="@+id/gear" android:layout_width="20dp" android:layout_height="20dp"
                       android:layout_marginStart="4dp" android:src="@android:drawable/ic_menu_preferences"/>
               </LinearLayout>
