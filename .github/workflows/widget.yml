@@ -1,6 +1,8 @@
-name: Build APK
+name: Build Merged App
 on:
   push:
+    paths:
+      - '.github/workflows/merged-app.yml'
   workflow_dispatch:
 jobs:
   build:
@@ -17,7 +19,7 @@ jobs:
           gradle-version: 8.7
       - name: Create project files
         run: |
-          mkdir -p btc-widget && cd btc-widget
+          mkdir -p merged-app && cd merged-app
           mkdir -p 'app'
           cat > 'app/build.gradle.kts' <<'END_OF_FILE_X'
           plugins { id("com.android.application"); id("org.jetbrains.kotlin.android") }
@@ -25,7 +27,7 @@ jobs:
               namespace = "com.btcwidget"
               compileSdk = 34
               defaultConfig {
-                  applicationId = "com.btcwidget"; minSdk = 26; targetSdk = 34
+                  applicationId = "com.mergedapp"; minSdk = 26; targetSdk = 34
                   versionCode = (project.findProperty("verCode") as String?)?.toIntOrNull() ?: 1
                   versionName = "1.0"
               }
@@ -50,6 +52,7 @@ jobs:
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE"/>
               <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
               <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
+              <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"/>
               <queries>
                   <intent>
                       <action android:name="android.intent.action.MAIN"/>
@@ -63,6 +66,10 @@ jobs:
                           <category android:name="android.intent.category.LAUNCHER"/>
                       </intent-filter>
                   </activity>
+                  <activity android:name=".IndexActivity" android:exported="false"
+                      android:theme="@android:style/Theme.DeviceDefault.Dialog" android:label="Indices"/>
+                  <activity android:name=".SfLaunch" android:exported="false" android:excludeFromRecents="true"
+                      android:noHistory="true" android:taskAffinity="" android:theme="@android:style/Theme.NoDisplay"/>
                   <receiver android:name=".WidgetProvider" android:exported="true">
                       <intent-filter><action android:name="android.appwidget.action.APPWIDGET_UPDATE"/></intent-filter>
                       <meta-data android:name="android.appwidget.provider" android:resource="@xml/widget_info"/>
@@ -80,9 +87,9 @@ jobs:
           mkdir -p 'app/src/main/java/com/btcwidget'
           cat > 'app/src/main/java/com/btcwidget/Adx.kt' <<'END_OF_FILE_X'
           package com.btcwidget
-          
+
           import kotlin.math.abs
-          
+
           object Adx {
               /** Wilder ADX. Returns (ADX, +DI, -DI); includes the currently forming candle. */
               fun calc(h: List<Double>, l: List<Double>, c: List<Double>, n: Int = 14): Triple<Double, Double, Double>? {
@@ -112,21 +119,21 @@ jobs:
           mkdir -p 'app/src/main/java/com/btcwidget'
           cat > 'app/src/main/java/com/btcwidget/Delta.kt' <<'END_OF_FILE_X'
           package com.btcwidget
-          
+
           import org.json.JSONObject
           import java.net.HttpURLConnection
           import java.net.URL
           import javax.crypto.Mac
           import javax.crypto.spec.SecretKeySpec
-          
+
           object Delta {
               const val BASE = "https://api.india.delta.exchange"
               const val SYMBOL = "BTCUSD"
-          
+
               fun secs(tf: String) = when (tf) {
                   "1m" -> 60; "3m" -> 180; "5m" -> 300; "15m" -> 900; "30m" -> 1800; "1h" -> 3600; else -> 14400
               }
-          
+
               private fun get(path: String, query: String, key: String?, secret: String?,
                               url: String? = null, token: String? = null): JSONObject {
                   val q = if (query.isEmpty()) "" else "?$query"
@@ -158,16 +165,30 @@ jobs:
                   }
                   return j
               }
-          
-              fun mark(sym: String): Double =
-                  get("/v2/tickers/$sym", "", null, null).getJSONObject("result").getString("mark_price").toDouble()
-          
+
+              /** Previous-session reference prices gathered from the sources, keyed by spec (ETH, NIFTY ...). */
+              val prevMap = java.util.concurrent.ConcurrentHashMap<String, Double>()
+              private val tlPrev = ThreadLocal<Double?>()
+              private val dprev = java.util.concurrent.ConcurrentHashMap<String, Double>()
+              private val yprev = java.util.concurrent.ConcurrentHashMap<String, Double>()
+              private val aprev = java.util.concurrent.ConcurrentHashMap<String, Double>()
+              @Volatile private var nsePrev: Map<String, Double> = emptyMap()
+
+              fun mark(sym: String): Double {
+                  val r = get("/v2/tickers/$sym", "", null, null).getJSONObject("result")
+                  val m = r.getString("mark_price").toDouble()
+                  val pct = r.optString("mark_change_24h", "").toDoubleOrNull()
+                  if (pct != null && pct > -99.0) dprev[sym] = m / (1 + pct / 100.0)
+                  tlPrev.set(dprev[sym])
+                  return m
+              }
+
               fun price(): Double = mark(SYMBOL)
-          
+
               // ---- Indian indices from angelone.in public pages (server-rendered; cached 3 s)
               private val icache = java.util.concurrent.ConcurrentHashMap<String, Pair<Long, Double>>()
               private val chgRe = Regex("""(\d{1,3}(?:,\d{2,3})*(?:\.\d+)?)\s*[+\-−]\s*[\d,]+(?:\.\d+)?\s*\(""")
-          
+
               private fun indexText(slug: String): String {
                   val c = URL("https://www.angelone.in/indices/$slug").openConnection() as HttpURLConnection
                   c.connectTimeout = 4000; c.readTimeout = 4000
@@ -178,7 +199,7 @@ jobs:
                   return html.replace(Regex("(?is)<(script|style)[^>]*>.*?</\\1>"), " ")
                       .replace(Regex("(?s)<[^>]+>"), " ").replace("&nbsp;", " ").replace(Regex("\\s+"), " ")
               }
-          
+
               private fun indexParse(text: String): Double? {
                   val i = text.indexOf("Price as of")
                   if (i > 0) {
@@ -187,54 +208,186 @@ jobs:
                   }
                   return chgRe.find(text)?.groupValues?.get(1)?.replace(",", "")?.toDoubleOrNull()
               }
-          
+
               fun indexPrice(slug: String): Double {
                   val now = System.currentTimeMillis()
-                  icache[slug]?.let { if (now - it.first < 3000) return it.second }
-                  val v = indexParse(indexText(slug)) ?: throw Exception("price not found for $slug")
+                  icache[slug]?.let { if (now - it.first < 3000) { tlPrev.set(aprev[slug]); return it.second } }
+                  val t = indexText(slug)
+                  val v = indexParse(t) ?: throw Exception("price not found for $slug")
+                  Regex("Previous\\s*Close\\D{0,12}([0-9][0-9,]*\\.?[0-9]*)", RegexOption.IGNORE_CASE).find(t)
+                      ?.groupValues?.get(1)?.replace(",", "")?.toDoubleOrNull()?.let { aprev[slug] = it }
                   icache[slug] = Pair(now, v)
+                  tlPrev.set(aprev[slug])
                   return v
               }
-          
-              /** For the "Test indices" button. */
+
+              // ---- NSE website (real time, one request returns every index; needs a session cookie)
+              private const val UA = "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36"
+              @Volatile private var nseCk: Pair<Long, String>? = null
+              @Volatile private var nseData: Pair<Long, Map<String, Double>>? = null
+
+              private fun httpGet(url: String, cookie: String?, referer: String? = null): Pair<String, String> {
+                  val c = URL(url).openConnection() as HttpURLConnection
+                  c.connectTimeout = 3000; c.readTimeout = 3000
+                  c.setRequestProperty("User-Agent", UA)
+                  c.setRequestProperty("Accept", "application/json, text/html, */*")
+                  c.setRequestProperty("Accept-Language", "en-US,en;q=0.9")
+                  if (referer != null) c.setRequestProperty("Referer", referer)
+                  if (cookie != null) c.setRequestProperty("Cookie", cookie)
+                  val body = c.inputStream.bufferedReader().readText()
+                  val ck = c.headerFields.filterKeys { it != null && it.equals("Set-Cookie", true) }.values
+                      .flatten().joinToString("; ") { it.substringBefore(';') }
+                  c.disconnect()
+                  return Pair(body, ck)
+              }
+
+              private fun nseCookie(): String {
+                  val now = System.currentTimeMillis()
+                  nseCk?.let { if (now - it.first < 240_000) return it.second }
+                  val ck = httpGet("https://www.nseindia.com/", null).second
+                  nseCk = Pair(now, ck)
+                  return ck
+              }
+
+              private fun nseIndices(): Map<String, Double> {
+                  val now = System.currentTimeMillis()
+                  nseData?.let { if (now - it.first < 900) return it.second }
+                  val body = try { httpGet("https://www.nseindia.com/api/allIndices", nseCookie(), "https://www.nseindia.com/").first }
+                             catch (e: Exception) { nseCk = null; throw e }
+                  val arr = JSONObject(body).getJSONArray("data")
+                  val m = HashMap<String, Double>(); val pm = HashMap<String, Double>()
+                  for (i in 0 until arr.length()) {
+                      val o = arr.getJSONObject(i)
+                      val v = o.optDouble("last", Double.NaN)
+                      val pc = o.optDouble("previousClose", Double.NaN)
+                      if (!v.isNaN()) m[o.optString("index").uppercase()] = v
+                      if (!pc.isNaN() && pc > 0) pm[o.optString("index").uppercase()] = pc
+                  }
+                  nsePrev = pm
+                  nseData = Pair(now, m)
+                  return m
+              }
+
+              private fun nseIdx(name: String): Double {
+                  val v = nseIndices()[name] ?: throw Exception("$name not in NSE data")
+                  tlPrev.set(nsePrev[name])
+                  return v
+              }
+
+              private fun nseGift(): Double {
+                  val body = try { httpGet("https://www.nseindia.com/api/NextApi/apiClient?functionName=getGiftNifty", nseCookie(), "https://www.nseindia.com/").first }
+                             catch (e: Exception) { nseCk = null; throw e }
+                  val m = Regex("\"(?:LASTPRICE|lastPrice|LastTradedPrice|last)\"\\s*:\\s*\"?([0-9][0-9,]*\\.?[0-9]*)", RegexOption.IGNORE_CASE).find(body)
+                      ?: throw Exception("gift price not in NSE reply")
+                  return m.groupValues[1].replace(",", "").toDouble()
+              }
+
+              // ---- Yahoo Finance (unofficial, no key; cached 1 s)
+              private val ycache = java.util.concurrent.ConcurrentHashMap<String, Pair<Long, Double>>()
+              fun yahoo(sym: String): Double {
+                  val now = System.currentTimeMillis()
+                  ycache[sym]?.let { if (now - it.first < 1000) { tlPrev.set(yprev[sym]); return it.second } }
+                  val u = "https://query1.finance.yahoo.com/v8/finance/chart/" + java.net.URLEncoder.encode(sym, "UTF-8") + "?interval=1d&range=5d"
+                  val body = httpGet(u, null).first
+                  val res = JSONObject(body).getJSONObject("chart").getJSONArray("result").getJSONObject(0)
+                  val meta = res.getJSONObject("meta")
+                  val v = meta.getDouble("regularMarketPrice")
+                  // previous close from daily bars: if the newest bar is the session still in progress (started < 23 h
+                  // before the latest quote), the previous close is the bar before it; otherwise it is the newest bar itself
+                  try {
+                      val rmt = meta.getLong("regularMarketTime")
+                      val ts = res.getJSONArray("timestamp")
+                      val cl = res.getJSONObject("indicators").getJSONArray("quote").getJSONObject(0).getJSONArray("close")
+                      val last = ts.length() - 1
+                      var i = if (rmt - ts.getLong(last) < 23 * 3600) last - 1 else last
+                      while (i >= 0 && cl.isNull(i)) i--
+                      if (i >= 0) { val pv = cl.getDouble(i); if (pv > 0) yprev[sym] = pv }
+                  } catch (_: Exception) {}
+                  tlPrev.set(yprev[sym])
+                  ycache[sym] = Pair(now, v)
+                  return v
+              }
+
+              /** Ordered list of sources for a spec; the first one that answers wins. */
+              private fun sources(spec: String): List<Pair<String, () -> Double>> {
+                  val s = spec.trim(); val low = s.lowercase()
+                  return when (s.uppercase()) {
+                      "BTC" -> listOf("Delta" to { mark("BTCUSD") })
+                      "NASDAQ" -> listOf("Yahoo" to { yahoo("^IXIC") })
+                      "DOW" -> listOf("Yahoo" to { yahoo("^DJI") })
+                      "CRUDE" -> listOf("Yahoo" to { yahoo("CL=F") })
+                      "ETH" -> listOf("Delta" to { mark("ETHUSD") })
+                      "GOLD" -> listOf("bullions" to { bullion("24k") })
+                      "SILVER" -> listOf("bullions" to { bullion("silver") })
+                      "NIFTY" -> listOf("NSE" to { nseIdx("NIFTY 50") }, "Yahoo" to { yahoo("^NSEI") }, "Angel" to { indexPrice("nifty-50") })
+                      "MIDCAP" -> listOf("NSE" to { nseIdx("NIFTY MIDCAP 100") }, "Yahoo" to { yahoo("NIFTY_MIDCAP_100.NS") }, "Angel" to { indexPrice("nifty-midcap-100") })
+                      "SMALL" -> listOf("NSE" to { nseIdx("NIFTY SMALLCAP 100") }, "Yahoo" to { yahoo("^CNXSC") }, "Angel" to { indexPrice("nifty-smallcap-100") })
+                      "VIX" -> listOf("NSE" to { nseIdx("INDIA VIX") }, "Yahoo" to { yahoo("^INDIAVIX") }, "Angel" to { indexPrice("india-vix") })
+                      "GIFT" -> listOf("NSE" to { nseGift() }, "Angel" to { indexPrice("gift-nifty") })
+                      "XAU" -> listOf("Delta" to { mark("XAUUSD") }, "Yahoo" to { yahoo("GC=F") })
+                      "USDINR" -> listOf("Yahoo" to { yahoo("INR=X") })
+                      else -> when {
+                          low.startsWith("bullions:") -> listOf("bullions" to { bullion(low.substring(9).trim()) })
+                          low.startsWith("delta:") -> listOf("Delta" to { mark(s.substring(6).trim().uppercase()) })
+                          low.startsWith("idx:") -> listOf("Angel" to { indexPrice(low.substring(4).trim()) })
+                          low.startsWith("yahoo:") -> listOf("Yahoo" to { yahoo(s.substring(6).trim()) })
+                          else -> listOf("Delta" to { mark(s.uppercase()) })
+                      }
+                  }
+              }
+
+              private val badUntil = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+              /** Price and the name of the source that supplied it. A source that failed is skipped for 30 s. */
+              fun quote(spec: String): Pair<Double, String> {
+                  val list = sources(spec)
+                  var last: Exception? = null
+                  for ((i, src) in list.withIndex()) {
+                      val key = spec.uppercase() + ":" + src.first
+                      val skip = (badUntil[key] ?: 0L) > System.currentTimeMillis() && i < list.size - 1
+                      if (skip) continue
+                      try {
+                          tlPrev.set(null)
+                          val v = src.second()
+                          val pv = tlPrev.get()
+                          if (pv != null) prevMap[spec.uppercase()] = pv else prevMap.remove(spec.uppercase())
+                          return Pair(v, src.first)
+                      }
+                      catch (e: Exception) { last = e; badUntil[key] = System.currentTimeMillis() + 30_000 }
+                  }
+                  throw last ?: Exception("no source for $spec")
+              }
+
+              fun priceFor(spec: String): Double = quote(spec).first
+
+              /** Previous close from the first source that has one (used when the source that gave the price had none). */
+              fun prevFor(spec: String): Double? {
+                  for ((_, f) in sources(spec)) {
+                      try { tlPrev.set(null); f(); tlPrev.get()?.let { if (it > 0) return it } } catch (_: Exception) {}
+                  }
+                  return null
+              }
+
+              /** For the "Test indices" button: every source of every built-in, tried one by one. */
               fun indexDebug(): String {
                   val sb = StringBuilder()
-                  for (slug in listOf("nifty-50", "nifty-midcap-100", "gift-nifty")) {
-                      try {
-                          val t = indexText(slug)
-                          val v = indexParse(t)
-                          sb.append("$slug -> ${v ?: "NOT FOUND"}\n")
-                          if (v == null) { val i = t.indexOf("Price as of"); sb.append("   near: ").append(if (i < 0) "marker not on page" else t.substring(maxOf(0, i - 120), i + 30)).append("\n") }
-                      } catch (e: Exception) { sb.append("$slug -> ERROR ${e.message}\n") }
+                  for (spec in listOf("NIFTY", "GOLD", "ETH", "SILVER", "MIDCAP", "SMALL", "GIFT", "VIX", "XAU", "NASDAQ", "DOW", "CRUDE", "USDINR")) {
+                      sb.append(spec).append(": ")
+                      val parts = sources(spec).map { (n, f) ->
+                          try { tlPrev.set(null); val v = f(); "$n=" + "%.1f".format(v) + (tlPrev.get()?.let { " (prev %.1f)".format(it) } ?: " (no prev)") } catch (e: Exception) { "$n=ERR(" + (e.message ?: e.javaClass.simpleName).take(40) + ")" }
+                      }
+                      sb.append(parts.joinToString("  ")).append("\n")
                   }
                   return sb.toString()
               }
-          
-              /** spec: ETH | GOLD | SILVER | NIFTY | MIDCAP | GIFT | delta:SYM | idx:SLUG | bullions:mcx|24k|22k|silver | bare Delta symbol. */
-              fun priceFor(spec: String): Double {
-                  val s = spec.trim()
-                  when (s.uppercase()) {
-                      "ETH" -> return mark("ETHUSD")
-                      "GOLD" -> return bullion("24k")
-                      "SILVER" -> return bullion("silver")
-                      "NIFTY" -> return indexPrice("nifty-50")
-                      "MIDCAP" -> return indexPrice("nifty-midcap-100")
-                      "GIFT" -> return indexPrice("gift-nifty")
-                  }
-                  val low = s.lowercase()
-                  if (low.startsWith("bullions:")) return bullion(low.substring(9).trim())
-                  if (low.startsWith("delta:")) return mark(s.substring(6).trim().uppercase())
-                  if (low.startsWith("idx:")) return indexPrice(low.substring(4).trim())
-                  return mark(s.uppercase())
-              }
-          
+
               /** Prices from bullions.co.in are in rupees: show without decimals and with a rupee sign. */
               fun isInr(spec: String): Boolean = spec.trim().equals("GOLD", true) || spec.trim().equals("SILVER", true) || spec.trim().lowercase().startsWith("bullions:")
-          
+
               // ---- bullions.co.in (read from the public web page; refreshed at most every 10 s)
               @Volatile private var bPage: Pair<Long, String>? = null
               private val numRe = Regex("""\d{1,3}(?:,\d{2,3})+(?:\.\d+)?|\d{4,}(?:\.\d+)?""")
-          
+
               private class BSpec(val label: Regex, val lo: Double, val hi: Double)
               private val bspecs = mapOf(
                   "mcx" to BSpec(Regex("""Gold\W{1,6}India\W{1,4}MCX""", RegexOption.IGNORE_CASE), 30000.0, 1_000_000.0),
@@ -242,7 +395,7 @@ jobs:
                   "22k" to BSpec(Regex("""Gold\W{1,4}22\W{0,3}(?:Karat|K)""", RegexOption.IGNORE_CASE), 30000.0, 1_000_000.0),
                   "silver" to BSpec(Regex("""Silver\W{1,6}India\W{1,4}MCX""", RegexOption.IGNORE_CASE), 30000.0, 5_000_000.0)
               )
-          
+
               private fun bullionsText(): String {
                   val now = System.currentTimeMillis()
                   bPage?.let { if (now - it.first < 10_000) return it.second }
@@ -259,7 +412,7 @@ jobs:
                   bPage = Pair(now, text)
                   return text
               }
-          
+
               private fun bullionsValue(text: String, spec: BSpec): Double? {
                   for (m in spec.label.findAll(text)) {
                       val win = text.substring(m.range.last + 1, minOf(text.length, m.range.last + 400))
@@ -270,12 +423,12 @@ jobs:
                   }
                   return null
               }
-          
+
               fun bullion(kind: String): Double {
                   val spec = bspecs[kind.lowercase()] ?: throw Exception("unknown bullions:$kind")
                   return bullionsValue(bullionsText(), spec) ?: throw Exception("not found on bullions.co.in")
               }
-          
+
               /** For the "Test gold" button: what was read for each rate, plus the raw text near the label if it failed. */
               fun bullionsDebug(): String {
                   val text = bullionsText()
@@ -292,19 +445,19 @@ jobs:
                   }
                   return sb.toString()
               }
-          
-          
+
+
               @Volatile var pnlErr = ""
-          
+
               private fun positions(relay: String, token: String, key: String, secret: String) =
                   (if (relay.isNotEmpty()) get("/positions", "", null, null, relay.trimEnd('/') + "/positions", token)
                    else get("/v2/positions/margined", "", key, secret)).getJSONArray("result")
-          
+
               private fun num(o: org.json.JSONObject?, k: String): Double? = o?.optString(k, "")?.toDoubleOrNull()
-          
+
               private fun symOf(p: org.json.JSONObject): String =
                   p.optString("product_symbol", "").ifEmpty { p.optJSONObject("product")?.optString("symbol") ?: "" }
-          
+
               /** Own calculation: size x contract_value x (mark - entry). Null when any input is missing or implausible. */
               private fun recompute(p: org.json.JSONObject, size: Double): Double? {
                   val entry = num(p, "entry_price") ?: return null
@@ -316,27 +469,38 @@ jobs:
                   val mark = num(t, "mark_price") ?: return null
                   return size * cv * (mark - entry)
               }
-          
+
               /** One consistent source: the live own calculation. Delta's reported figure is only a fallback. */
+              /** Fee setting: "" = none, "auto" = subtract the position's own commission field, number = rupees per open position. */
+              @Volatile var feeMode = ""
+              @Volatile var rateInr = 85.0
+              private fun feeUsd(p: org.json.JSONObject, fee: String = feeMode, rate: Double = rateInr): Double {
+                  if (fee.isEmpty()) return 0.0
+                  if (fee == "auto") return Math.abs(num(p, "commission") ?: 0.0)
+                  val inr = fee.toDoubleOrNull() ?: return 0.0
+                  return inr / (if (rate > 0) rate else 85.0)
+              }
+
               @Volatile var pnlMode = ""   // "" / "delta" = Delta's own figure first, "own" = own calculation first
-          
+
               /**
                * Default: use Delta's own unrealized_pnl (exactly what its app shows, same server, same instant),
                * but fall back to the own calculation when it is missing or absurdly far from it (guards the old
                * "market value instead of PnL" problem). Mode "own" prefers the own calculation.
                */
-              private fun pick(api: Double?, own: Double?): Double {
-                  if (pnlMode == "own") return own ?: api ?: 0.0
-                  if (api == null) return own ?: 0.0
-                  if (own == null) return api
-                  return if (Math.abs(api - own) > Math.max(10.0, 5 * Math.abs(own))) own else api
+              private fun pick(api: Double?, own: Double?, mode: String = pnlMode): Double {
+                  // Delta's unrealized_pnl field turned out to be wrong for option positions, so the own calculation
+                  // (size x contract value x (mark - entry)) is the default. Mode "delta" prefers Delta's field.
+                  if (mode == "delta") return api ?: own ?: 0.0
+                  return own ?: api ?: 0.0
               }
-          
+
               /** Background threads for fetching all option prices at the same time. */
               private val fetchPool = java.util.concurrent.Executors.newCachedThreadPool { r -> Thread(r).apply { isDaemon = true } }
-          
+
               /** PnL (USD) and number of open positions. */
-              fun pnl(key: String, secret: String, relay: String = "", token: String = ""): Pair<Double, Int> {
+              fun pnl(key: String, secret: String, relay: String = "", token: String = "",
+                      mode: String = pnlMode, fee: String = feeMode, rate: Double = rateInr): Pair<Double, Int> {
                   val r = positions(relay, token, key, secret)
                   val jobs = ArrayList<Triple<org.json.JSONObject, Double, java.util.concurrent.Future<Double?>>>()
                   for (i in 0 until r.length()) {
@@ -350,13 +514,14 @@ jobs:
                   var sum = 0.0
                   for ((p, _, f) in jobs) {
                       val own = try { f.get(4, java.util.concurrent.TimeUnit.SECONDS) } catch (_: Exception) { null }
-                      sum += pick(num(p, "unrealized_pnl"), own)
+                      sum += pick(num(p, "unrealized_pnl"), own, mode) - feeUsd(p, fee, rate)
                   }
                   return Pair(sum, jobs.size)
               }
-          
+
               /** Human-readable dump used by the "Test PnL" button in settings. */
-              fun pnlDebug(key: String, secret: String, relay: String, token: String, rate: Double): String {
+              fun pnlDebug(key: String, secret: String, relay: String, token: String, rate: Double,
+                           mode: String = pnlMode, fee: String = feeMode): String {
                   val r = positions(relay, token, key, secret)
                   val sb = StringBuilder()
                   var total = 0.0; var open = 0
@@ -367,18 +532,19 @@ jobs:
                       open++
                       val api = num(p, "unrealized_pnl")
                       val own = try { recompute(p, size) } catch (e: Exception) { null }
-                      val used = pick(api, own)
+                      val used = pick(api, own, mode)
                       sb.append("${symOf(p)}  size=${p.optString("size")}  entry=${p.optString("entry_price")}\n")
                       sb.append("  Delta unrealized_pnl: ${api ?: "missing"}\n")
                       sb.append("  own calculation: ${own ?: "n/a"}\n")
+                      sb.append("  commission field: ${p.optString("commission", "missing")}   fee applied: ${"%.4f".format(feeUsd(p, fee, rate))}\n")
                       sb.append("  used: $used   (Rs ${"%.2f".format(used * rate)})\n")
-                      total += used
+                      total += used - feeUsd(p, fee, rate)
                   }
                   if (open == 0) return "No open positions."
                   sb.append("\nTotal: $${"%.4f".format(total)}  x ${"%.2f".format(rate)} = Rs ${"%.2f".format(total * rate)}\n")
                   return sb.toString()
               }
-          
+
               fun candles(tf: String): Triple<List<Double>, List<Double>, List<Double>> {
                   val now = System.currentTimeMillis() / 1000
                   val r = get("/v2/history/candles",
@@ -390,16 +556,113 @@ jobs:
           END_OF_FILE_X
 
           mkdir -p 'app/src/main/java/com/btcwidget'
+          cat > 'app/src/main/java/com/btcwidget/IndexActivity.kt' <<'END_OF_FILE_X'
+          package com.btcwidget
+
+          import android.app.Activity
+          import android.graphics.Color
+          import android.graphics.Typeface
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.view.Gravity
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import java.util.Locale
+          import java.util.concurrent.Executors
+
+          /** Pop-up opened from the widget's INDICES button: every index with change vs the previous session. */
+          class IndexActivity : Activity() {
+              private val names = ArrayList<Pair<String, String>>().apply { addAll(listOf(
+                  "Nifty 50" to "NIFTY", "Gift Nifty" to "GIFT", "Midcap 100" to "MIDCAP", "Smallcap 100" to "SMALL", "India VIX" to "VIX",
+                  "BTC" to "BTC", "ETH" to "ETH", "XAUUSD" to "XAU", "Gold" to "GOLD", "Silver" to "SILVER",
+                  "Dow Jones" to "DOW", "Nasdaq" to "NASDAQ", "Crude Oil" to "CRUDE")) }
+              private val srcs = java.util.concurrent.ConcurrentHashMap<Int, String>()
+              private val pool = Executors.newFixedThreadPool(9)
+              private val ui = Handler(Looper.getMainLooper())
+              private val rows = ArrayList<Triple<TextView, TextView, TextView>>()
+              @Volatile private var running = true
+              private var foot: TextView? = null
+
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  for ((l, sp) in Prefs.extras(this)) if (sp !in Prefs.BUILTIN) names.add(l to sp)
+                  names.add("USD/INR" to "USDINR")
+                  val d = resources.displayMetrics.density
+                  val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding((16 * d).toInt(), (12 * d).toInt(), (16 * d).toInt(), (12 * d).toInt()) }
+                  root.addView(TextView(this).apply { text = "Prices vs previous close"; textSize = 17f; setTypeface(null, Typeface.BOLD) })
+                  for ((label, _) in names) {
+                      val r = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; setPadding(0, (7 * d).toInt(), 0, (7 * d).toInt()) }
+                      val a = TextView(this).apply { text = label; textSize = 15f; setTypeface(null, Typeface.BOLD) }
+                      val p = TextView(this).apply { text = "--"; textSize = 15f; gravity = Gravity.END }
+                      val c = TextView(this).apply { text = ""; textSize = 15f; gravity = Gravity.END; setTypeface(null, Typeface.BOLD) }
+                      r.addView(a, LinearLayout.LayoutParams(0, -2, 1.1f))
+                      r.addView(p, LinearLayout.LayoutParams(0, -2, 1.0f))
+                      r.addView(c, LinearLayout.LayoutParams(0, -2, 1.5f))
+                      root.addView(r)
+                      rows.add(Triple(a, p, c))
+                  }
+                  foot = TextView(this).apply { textSize = 11f; setTextColor(Color.GRAY); setPadding(0, (8 * d).toInt(), 0, 0) }
+                  root.addView(foot)
+                  setContentView(root)
+                  loop()
+              }
+
+              private fun loop() {
+                  if (!running) return
+                  for ((i, e) in names.withIndex()) {
+                      val spec = e.second
+                      pool.execute {
+                          var price: Double? = null; var prev: Double? = null; var own = false
+                          try {
+                              val q = Delta.quote(spec); price = q.first; srcs[i] = q.second
+                              prev = Delta.prevMap[spec] ?: Delta.prevFor(spec)
+                              val ref = Prefs.refPrev(this, spec, price)
+                              if (prev == null) { prev = ref; own = ref != null }
+                          } catch (_: Exception) {}
+                          val pr = price; val pv = prev; val o = own
+                          ui.post { if (running) show(i, pr, pv, o) }
+                      }
+                  }
+                  ui.postDelayed({ loop() }, 1000)
+              }
+
+              private fun show(i: Int, price: Double?, prev: Double?, own: Boolean) {
+                  val (_, p, c) = rows[i]
+                  if (price != null && prev != null) { /* shown below */ }
+                  val spec = names[i].second
+                  if (price == null) { p.text = "--"; c.text = ""; return }
+                  val inr = Delta.isInr(spec)
+                  val fx = spec == "USDINR"
+                  p.text = if (fx) String.format(Locale.US, "₹%.2f", price) else if (inr) String.format(Locale.US, "₹%,.0f", price)
+                           else if (price >= 10000) String.format(Locale.US, "%,.0f", price) else String.format(Locale.US, "%,.1f", price)
+                  if (prev == null || prev <= 0.0) { c.text = "n/a"; c.setTextColor(Color.GRAY); return }
+                  val diff = price - prev
+                  val pct = diff / prev * 100.0
+                  val pts = if (fx) String.format(Locale.US, "%+.2f", diff) else if (Math.abs(diff) >= 100) String.format(Locale.US, "%+,.0f", diff) else String.format(Locale.US, "%+,.1f", diff)
+                  c.text = String.format(Locale.US, "%s (%+.2f%%)%s", pts, pct, if (own) "*" else "")
+                  c.setTextColor(if (diff >= 0) Color.rgb(0, 150, 60) else Color.rgb(210, 40, 40))
+                  foot?.text = "Sources: " + names.indices.joinToString(", ") { k -> names[k].second + "=" + (srcs[k] ?: "-") } +
+                      "\n* change is vs the widget's own saved close of the previous day"
+              }
+
+              override fun onDestroy() { running = false; pool.shutdownNow(); super.onDestroy() }
+          }
+          END_OF_FILE_X
+
+          mkdir -p 'app/src/main/java/com/btcwidget'
           cat > 'app/src/main/java/com/btcwidget/Prefs.kt' <<'END_OF_FILE_X'
           package com.btcwidget
-          
+
           import android.content.Context
-          
+
           object Prefs {
               const val ACTION_CYCLE = "com.btcwidget.CYCLE"
               val TFS = listOf("1m", "3m", "5m", "15m", "30m", "1h", "4h")
               val SLOT_KEYS = listOf("tvpkg", "dpkg", "tpkg") + (4..12).map { "app$it" }
-          
+              /** The 3 Secure Folder buttons: "package/activity|profile serial". */
+              val SF_KEYS = listOf("sf1", "sf2", "sf3")
+
               fun sp(c: Context) = c.getSharedPreferences("w", Context.MODE_PRIVATE)
               fun alpha(c: Context) = sp(c).getInt("alpha", 180)
               fun tsize(c: Context) = sp(c).getInt("tsize", 15)
@@ -414,26 +677,127 @@ jobs:
                       else -> v.toDoubleOrNull() ?: 85.0
                   }
               }
-          
+
               fun tfs(c: Context): List<String> {
                   val l = str(c, "tfs").split(",").map { it.trim() }.filter { it in TFS }.distinct().take(4)
                   return if (l.isEmpty()) listOf("5m", "15m", "1h") else l
               }
-          
-              val BUILTIN = listOf("ETH", "GOLD", "NIFTY", "SILVER", "MIDCAP", "GIFT")
-          
+
+              val BUILTIN = listOf("NIFTY", "GOLD", "ETH", "SILVER", "MIDCAP", "SMALL", "GIFT", "VIX", "XAU")
+              private val LABELS = mapOf("NIFTY" to "Nifty", "GOLD" to "Gold", "ETH" to "ETH", "SILVER" to "Silv", "MIDCAP" to "Mid",
+                  "SMALL" to "Small", "GIFT" to "Gift", "VIX" to "VIX", "XAU" to "XAU")
+
               /** (label, spec) pairs shown under BTC: the built-ins, then up to 3 custom slots. */
               fun extras(c: Context): List<Pair<String, String>> {
                   // all six built-ins always show; the field only hides some ("-GIFT,-ETH") or everything ("none")
                   val s = str(c, "extras").uppercase()
                   val hide = s.split(",").map { it.trim().removePrefix("-") }.toSet()
                   val names = if (s == "NONE") emptyList() else BUILTIN.filter { it !in hide || !s.contains("-") }
-                  val out = names.map { (if (it == "SILVER" || it == "MIDCAP" || it == "GIFT") it.lowercase().replaceFirstChar { c -> c.uppercase() } else it) to it }.toMutableList()
+                  val out = names.map { (LABELS[it] ?: it) to it }.toMutableList()
                   for (i in 1..3) {
                       val sym = str(c, "c${i}s")
                       if (sym.isNotEmpty()) out.add(str(c, "c${i}l").ifEmpty { sym.substringAfter(':').uppercase() } to sym)
                   }
                   return out
+              }
+
+              // ---- own record of the previous day's last price (fallback when a source gives no previous close)
+              private class Ref(var day: String, var last: Double, var prev: Double, var saved: Long)
+              private val refMem = java.util.concurrent.ConcurrentHashMap<String, Ref>()
+
+              private fun today(): String = java.text.SimpleDateFormat("yyyyMMdd", java.util.Locale.US)
+                  .apply { timeZone = java.util.TimeZone.getTimeZone("Asia/Kolkata") }.format(java.util.Date())
+
+              fun refPrev(c: Context, spec: String, price: Double): Double? {
+                  val k = spec.uppercase(); val day = today(); val p = sp(c); val now = System.currentTimeMillis()
+                  val st = refMem.getOrPut(k) {
+                      Ref(p.getString("rd_$k", "") ?: "", p.getString("rl_$k", "")?.toDoubleOrNull() ?: 0.0,
+                          p.getString("rp_$k", "")?.toDoubleOrNull() ?: 0.0, 0L)
+                  }
+                  var save = now - st.saved > 30_000
+                  if (st.day != day) { if (st.last > 0) st.prev = st.last; st.day = day; save = true }
+                  st.last = price
+                  if (save) { st.saved = now; p.edit().putString("rd_$k", st.day).putString("rl_$k", st.last.toString()).putString("rp_$k", st.prev.toString()).apply() }
+                  return if (st.prev > 0) st.prev else null
+              }
+          }
+          END_OF_FILE_X
+
+          mkdir -p 'app/src/main/java/com/btcwidget'
+          cat > 'app/src/main/java/com/btcwidget/Sf.kt' <<'END_OF_FILE_X'
+          package com.btcwidget
+
+          import android.app.Activity
+          import android.content.ComponentName
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.LauncherActivityInfo
+          import android.content.pm.LauncherApps
+          import android.graphics.Bitmap
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.Process
+          import android.os.UserHandle
+          import android.os.UserManager
+          import android.widget.Toast
+          import androidx.core.graphics.drawable.toBitmap
+
+          /** Apps of the other phone profiles (Samsung Secure Folder), seen and opened through the system's LauncherApps. */
+          object Sf {
+              class App(val label: String, val value: String)
+
+              private fun la(c: Context) = c.getSystemService(LauncherApps::class.java)
+              private fun um(c: Context) = c.getSystemService(UserManager::class.java)
+
+              fun otherProfiles(c: Context): List<UserHandle> {
+                  val me = Process.myUserHandle()
+                  val all: List<UserHandle> = try { if (Build.VERSION.SDK_INT >= 28) la(c).profiles else um(c).userProfiles } catch (_: Exception) { emptyList() }
+                  return all.filter { it != me }
+              }
+
+              fun apps(c: Context): List<App> = otherProfiles(c).flatMap { u ->
+                  val serial = um(c).getSerialNumberForUser(u)
+                  val list: List<LauncherActivityInfo> = try { la(c).getActivityList(null, u) } catch (_: Exception) { emptyList() }
+                  list.map { App(it.label.toString(), it.componentName.flattenToString() + "|" + serial) }
+              }.sortedBy { it.label.lowercase() }
+
+              private fun parse(c: Context, v: String): Pair<ComponentName, UserHandle>? {
+                  val parts = v.split("|")
+                  if (parts.size != 2) return null
+                  val cn = ComponentName.unflattenFromString(parts[0]) ?: return null
+                  val u = um(c).getUserForSerialNumber(parts[1].toLongOrNull() ?: return null) ?: return null
+                  return Pair(cn, u)
+              }
+
+              private fun info(c: Context, v: String): LauncherActivityInfo? {
+                  val (cn, u) = parse(c, v) ?: return null
+                  return try {
+                      la(c).resolveActivity(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER).setComponent(cn), u)
+                  } catch (_: Exception) { null }
+              }
+
+              fun label(c: Context, v: String): String =
+                  if (v.isEmpty()) "empty" else info(c, v)?.label?.toString() ?: v.substringBefore('/')
+
+              /** Icon with the Secure Folder badge, like on the home screen. */
+              fun icon(c: Context, v: String): Bitmap? = try { info(c, v)?.getBadgedIcon(0)?.toBitmap(96, 96) } catch (_: Exception) { null }
+
+              fun launch(c: Context, v: String) {
+                  val (cn, u) = parse(c, v) ?: throw Exception("app not found")
+                  la(c).startMainActivity(cn, u, null, null)
+              }
+          }
+
+          /** Invisible screen the widget's Secure Folder buttons open; it starts the chosen app inside Secure Folder. */
+          class SfLaunch : Activity() {
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  val v = intent.getStringExtra("v").orEmpty()
+                  try { Sf.launch(this, v) }
+                  catch (e: Exception) {
+                      Toast.makeText(applicationContext, "Could not open: " + (e.message ?: e.javaClass.simpleName), Toast.LENGTH_LONG).show()
+                  }
+                  finish()
               }
           }
           END_OF_FILE_X
@@ -441,7 +805,7 @@ jobs:
           mkdir -p 'app/src/main/java/com/btcwidget'
           cat > 'app/src/main/java/com/btcwidget/SettingsActivity.kt' <<'END_OF_FILE_X'
           package com.btcwidget
-          
+
           import android.app.Activity
           import android.app.AlertDialog
           import android.content.Intent
@@ -450,7 +814,7 @@ jobs:
           import android.os.Bundle
           import android.widget.*
           import androidx.core.widget.doAfterTextChanged
-          
+
           class SettingsActivity : Activity() {
               override fun onCreate(b: Bundle?) {
                   super.onCreate(b)
@@ -459,7 +823,7 @@ jobs:
                   val sp = Prefs.sp(this)
                   val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(40, 40, 40, 40) }
                   fun label(t: String) = root.addView(TextView(this).apply { text = t; setPadding(0, 32, 0, 0) })
-          
+
                   fun seek(title: String, maxV: Int, init: Int, save: (Int) -> Unit) {
                       label(title)
                       root.addView(SeekBar(this).apply {
@@ -475,7 +839,7 @@ jobs:
                       sp.edit().putInt("alpha", it).apply() }
                   seek("Text size for prices, PnL, Pos and ADX (11-20)", 9, Prefs.tsize(this) - 11) {
                       sp.edit().putInt("tsize", it + 11).apply() }
-          
+
                   fun field(k: String, hint: String) {
                       label(hint)
                       root.addView(EditText(this).apply {
@@ -487,26 +851,27 @@ jobs:
                   field("rtoken", "Relay token")
                   field("key", "Delta API key (read-only; optional backup if relay is down)")
                   field("secret", "Delta API secret (optional backup)")
-                  field("extras", "Built-in prices: blank = all six (ETH GOLD NIFTY SILVER MIDCAP GIFT). To hide some type e.g. -GIFT,-ETH ; type none to hide all")
-                  label("Extra indexes (3 slots, shown on a third row): a name and a symbol. Symbols: SOLUSD (Delta), " +
-                        "idx:nifty-bank idx:sensex (angelone.in/indices/<name>), bullions:mcx bullions:24k bullions:22k bullions:silver (rupees)")
+                  label("Extra prices for the INDICES pop-up (3 slots): a name and a symbol. Symbols: SOLUSD (Delta), idx:nifty-bank idx:sensex (angelone.in/indices/<name>), yahoo:^NSEBANK, bullions:mcx bullions:24k bullions:22k bullions:silver")
                   for (i in 1..3) {
                       field("c${i}l", "Index $i name (e.g. BANKNIFTY)")
                       field("c${i}s", "Index $i symbol")
                   }
-                  field("pnlsrc", "PnL source: blank = Delta's own figure (matches its app); type own to use the widget's own calculation")
+                  field("pnlsrc", "PnL source: blank = widget calculation (recommended). Type delta to use Delta's own field (known to be wrong for options)")
+                  field("fee", "Fee per open position in rupees, subtracted from PnL. Try 12. Blank = none")
                   field("rate", "USD-to-INR rate for PnL (blank = 85, Delta's fixed rate; type usd to show dollars)")
                   field("tfs", "ADX timeframes, comma-separated (blank = 5m,15m,1h; options 1m,3m,5m,15m,30m,1h,4h)")
-          
+
                   root.addView(Button(this).apply {
                       text = "Test PnL (shows raw Delta numbers)"
                       setOnClickListener {
                           val relay = Prefs.str(this@SettingsActivity, "relay"); val tok = Prefs.str(this@SettingsActivity, "rtoken")
                           val key = Prefs.str(this@SettingsActivity, "key"); val sec = Prefs.str(this@SettingsActivity, "secret")
                           val rate = Prefs.rate(this@SettingsActivity)
+                          val fee = Prefs.str(this@SettingsActivity, "fee").lowercase()
+                          val mode = Prefs.str(this@SettingsActivity, "pnlsrc").lowercase()
                           Toast.makeText(this@SettingsActivity, "Fetching...", Toast.LENGTH_SHORT).show()
                           Thread {
-                              val out = try { Delta.pnlDebug(key, sec, relay, tok, if (rate > 0) rate else 85.0) }
+                              val out = try { Delta.pnlDebug(key, sec, relay, tok, if (rate > 0) rate else 85.0, mode, fee) }
                                         catch (e: Exception) { "Error: " + (e.message ?: e.javaClass.simpleName) }
                               runOnUiThread {
                                   AlertDialog.Builder(this@SettingsActivity).setTitle("PnL check").setMessage(out)
@@ -529,7 +894,7 @@ jobs:
                       }
                   })
                   root.addView(Button(this).apply {
-                      text = "Test indices (Nifty, Midcap, Gift)"
+                      text = "Test prices (shows each source)"
                       setOnClickListener {
                           Toast.makeText(this@SettingsActivity, "Fetching...", Toast.LENGTH_SHORT).show()
                           Thread {
@@ -547,11 +912,11 @@ jobs:
                           startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://india.delta.exchange/app/account/manageapikeys")))
                       }
                   })
-          
+
                   fun appName(pkg: String): String = if (pkg.isEmpty()) "empty" else try {
                       packageManager.getApplicationLabel(packageManager.getApplicationInfo(pkg, 0)).toString()
                   } catch (e: Exception) { pkg }
-          
+
                   fun pick(k: String, n: Int) {
                       val btn = Button(this)
                       fun refresh() { btn.text = "Button $n: " + appName(sp.getString(k, "").orEmpty()) }
@@ -570,7 +935,61 @@ jobs:
                   }
                   label("Widget buttons: 6 per row, 2 rows. Pick any installed app for each.")
                   Prefs.SLOT_KEYS.forEachIndexed { i, k -> pick(k, i + 1) }
-          
+
+                  // ---------------- Secure Folder account (2nd Delta account) ----------------
+                  root.addView(TextView(this).apply {
+                      text = "SECURE FOLDER ACCOUNT (2nd Delta account)"; textSize = 18f
+                      setTypeface(typeface, android.graphics.Typeface.BOLD); setPadding(0, 64, 0, 0)
+                  })
+                  field("key2", "2nd account Delta API key (read-only key is enough)")
+                  field("secret2", "2nd account Delta API secret")
+                  field("relay2", "2nd account relay URL (optional; must be set up for the 2nd account's key)")
+                  field("rtoken2", "2nd account relay token (optional)")
+                  field("pnlsrc2", "2nd account PnL source: blank = widget calculation (recommended); type delta for Delta's own field")
+                  field("fee2", "2nd account fee per open position in rupees. Blank = none")
+                  root.addView(Button(this).apply {
+                      text = "Test PnL of 2nd account"
+                      setOnClickListener {
+                          val rate = Prefs.rate(this@SettingsActivity)
+                          val c = this@SettingsActivity
+                          Toast.makeText(c, "Fetching...", Toast.LENGTH_SHORT).show()
+                          Thread {
+                              val out = try {
+                                  Delta.pnlDebug(Prefs.str(c, "key2"), Prefs.str(c, "secret2"), Prefs.str(c, "relay2"), Prefs.str(c, "rtoken2"),
+                                      if (rate > 0) rate else 85.0, Prefs.str(c, "pnlsrc2").lowercase(), Prefs.str(c, "fee2").lowercase())
+                              } catch (e: Exception) { "Error: " + (e.message ?: e.javaClass.simpleName) }
+                              runOnUiThread {
+                                  AlertDialog.Builder(c).setTitle("2nd account PnL check").setMessage(out).setPositiveButton("OK", null).show()
+                              }
+                          }.start()
+                      }
+                  })
+
+                  fun sfPick(k: String, n: Int) {
+                      val btn = Button(this)
+                      fun refresh() { btn.text = "Secure Folder button $n: " + Sf.label(this, sp.getString(k, "").orEmpty()) }
+                      refresh()
+                      btn.setOnClickListener {
+                          val apps = Sf.apps(this)
+                          if (apps.isEmpty()) {
+                              AlertDialog.Builder(this).setTitle("Secure Folder apps not visible")
+                                  .setMessage("This phone does not let other apps see the apps inside Secure Folder " +
+                                      "(profiles found: ${Sf.otherProfiles(this).size}). Unlock Secure Folder once and try again. " +
+                                      "If it still shows nothing, keep using the 3 Secure Folder shortcut icons on the home screen.")
+                                  .setPositiveButton("OK", null).show()
+                              return@setOnClickListener
+                          }
+                          AlertDialog.Builder(this).setTitle("Secure Folder button $n")
+                              .setItems((listOf("None (empty slot)") + apps.map { it.label }).toTypedArray()) { _, i ->
+                                  sp.edit().putString(k, if (i == 0) "" else apps[i - 1].value).apply()
+                                  refresh(); WidgetProvider.start(this)
+                              }.show()
+                      }
+                      root.addView(btn)
+                  }
+                  label("Secure Folder buttons (3, one row under the app buttons). They open the app inside Secure Folder.")
+                  Prefs.SF_KEYS.forEachIndexed { i, k -> sfPick(k, i + 1) }
+
                   setContentView(ScrollView(this).apply { addView(root) })
                   WidgetProvider.start(this)
               }
@@ -580,7 +999,7 @@ jobs:
           mkdir -p 'app/src/main/java/com/btcwidget'
           cat > 'app/src/main/java/com/btcwidget/UpdateService.kt' <<'END_OF_FILE_X'
           package com.btcwidget
-          
+
           import android.app.*
           import android.appwidget.AppWidgetManager
           import android.content.ComponentName
@@ -600,27 +1019,28 @@ jobs:
           import java.util.concurrent.Executors
           import java.util.concurrent.Future
           import java.util.concurrent.TimeUnit
-          
+
           class UpdateService : Service() {
               private val pool = Executors.newFixedThreadPool(16)
-              private val loop = Executors.newScheduledThreadPool(3)
+              private val loop = Executors.newScheduledThreadPool(4)
               private var started = false
-          
+
               private val slotIds = listOf(R.id.btn1, R.id.btn2, R.id.btn3, R.id.btn4, R.id.btn5, R.id.btn6,
                   R.id.btn7, R.id.btn8, R.id.btn9, R.id.btn10, R.id.btn11, R.id.btn12)
-          
+              private val sfIds = listOf(R.id.sf1, R.id.sf2, R.id.sf3)
+
               override fun onBind(i: Intent?): IBinder? = null
-          
+
               override fun onCreate() {
                   super.onCreate()
                   val nm = getSystemService(NotificationManager::class.java)
                   nm.createNotificationChannel(NotificationChannel("w", "Widget refresh", NotificationManager.IMPORTANCE_MIN))
-                  val n = Notification.Builder(this, "w").setContentTitle("BTC widget running")
+                  val n = Notification.Builder(this, "w").setContentTitle("Merged widget running")
                       .setSmallIcon(android.R.drawable.ic_dialog_info).build()
                   if (Build.VERSION.SDK_INT >= 34) startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
                   else startForeground(1, n)
               }
-          
+
               override fun onStartCommand(i: Intent?, f: Int, id: Int): Int {
                   initWidget()
                   if (!started) {
@@ -628,26 +1048,27 @@ jobs:
                       // three independent loops: a slow ADX / gold / Nifty request can never delay the PnL
                       loop.scheduleWithFixedDelay({ try { fastTick() } catch (_: Throwable) {} }, 0, 500, TimeUnit.MILLISECONDS)
                       loop.scheduleWithFixedDelay({ try { adxTick() } catch (_: Throwable) {} }, 0, 1500, TimeUnit.MILLISECONDS)
-                      loop.scheduleWithFixedDelay({ try { extraTick() } catch (_: Throwable) {} }, 0, 1500, TimeUnit.MILLISECONDS)
+                      loop.scheduleWithFixedDelay({ try { extraTick() } catch (_: Throwable) {} }, 0, 1000, TimeUnit.MILLISECONDS)
+                      loop.scheduleWithFixedDelay({ try { sfTick() } catch (_: Throwable) {} }, 0, 1000, TimeUnit.MILLISECONDS)
                   }
                   return START_STICKY
               }
-          
+
               private fun ids() = AppWidgetManager.getInstance(this)
                   .getAppWidgetIds(ComponentName(this, WidgetProvider::class.java))
-          
+
               private fun icon(pkg: String): Bitmap {
                   val d: Drawable = try { packageManager.getApplicationIcon(pkg) }
                   catch (e: Exception) { getDrawable(android.R.drawable.sym_def_app_icon)!! }
                   return d.toBitmap(96, 96)
               }
-          
+
               private fun open(code: Int, pkg: String): PendingIntent? {
                   val i = packageManager.getLaunchIntentForPackage(pkg) ?: return null
                   i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                   return PendingIntent.getActivity(this, code, i, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
               }
-          
+
               /** Full update: icons + click targets. Text is refreshed by tick(). */
               private fun initWidget() {
                   val rv = RemoteViews(packageName, R.layout.widget)
@@ -661,34 +1082,74 @@ jobs:
                   }
                   rv.setViewVisibility(R.id.row1, if (pkgs.subList(0, 6).any { it.isNotEmpty() }) View.VISIBLE else View.GONE)
                   rv.setViewVisibility(R.id.row2, if (pkgs.subList(6, 12).any { it.isNotEmpty() }) View.VISIBLE else View.GONE)
+                  // Secure Folder buttons: opened through the invisible SfLaunch screen
+                  val sfs = Prefs.SF_KEYS.map { Prefs.str(this, it) }
+                  for (i in 0 until 3) {
+                      val v = sfs[i]
+                      val bmp = if (v.isEmpty()) null else Sf.icon(this, v)
+                      if (v.isEmpty()) { rv.setViewVisibility(sfIds[i], View.GONE); continue }
+                      rv.setViewVisibility(sfIds[i], View.VISIBLE)
+                      rv.setImageViewBitmap(sfIds[i], bmp ?: getDrawable(android.R.drawable.sym_def_app_icon)!!.toBitmap(96, 96))
+                      rv.setOnClickPendingIntent(sfIds[i], PendingIntent.getActivity(this, 40 + i,
+                          Intent(this, SfLaunch::class.java).putExtra("v", v).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                          PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT))
+                  }
+                  rv.setViewVisibility(R.id.row3, if (sfs.any { it.isNotEmpty() }) View.VISIBLE else View.GONE)
+                  rv.setOnClickPendingIntent(R.id.idxbtn, PendingIntent.getActivity(this, 4,
+                      Intent(this, IndexActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK), PendingIntent.FLAG_IMMUTABLE))
                   rv.setOnClickPendingIntent(R.id.gear, PendingIntent.getActivity(this, 3,
                       Intent(this, SettingsActivity::class.java), PendingIntent.FLAG_IMMUTABLE))
                   AppWidgetManager.getInstance(this).updateAppWidget(ids(), rv)
               }
-          
+
               private fun <T> async(f: () -> T): Future<T?> = pool.submit(Callable<T?> { try { f() } catch (e: Exception) { null } })
-          
+
               /** Relay first (fixed IP); if it fails and a direct key is saved, try direct. */
-              private fun fetchPnl(key: String, sec: String, relay: String, rtok: String): Pair<Double, Int>? {
-                  Delta.pnlMode = Prefs.str(this, "pnlsrc").lowercase()
+              @Volatile private var pnlErr2 = ""
+
+              /** Same as before, for one account. sfx = "" for the main account, "2" for the Secure Folder account. */
+              private fun fetchPnl(key: String, sec: String, relay: String, rtok: String, sfx: String = ""): Pair<Double, Int>? {
+                  val mode = Prefs.str(this, "pnlsrc$sfx").lowercase()
+                  val fee = Prefs.str(this, "fee$sfx").lowercase()
+                  val rate = Prefs.rate(this)
+                  fun setErr(m: String) { if (sfx.isEmpty()) Delta.pnlErr = m else pnlErr2 = m }
                   val direct = key.isNotEmpty() && sec.isNotEmpty()
-                  if (relay.isEmpty() && !direct) { Delta.pnlErr = "add relay or API key in app"; return null }
+                  if (relay.isEmpty() && !direct) { setErr(if (sfx.isEmpty()) "add relay or API key in app" else "add 2nd account key in app"); return null }
                   try {
-                      val r = Delta.pnl(key, sec, relay, rtok); Delta.pnlErr = ""; return r
+                      val r = Delta.pnl(key, sec, relay, rtok, mode, fee, rate); setErr(""); return r
                   } catch (e: Exception) {
                       if (relay.isNotEmpty() && direct) {
-                          try { val r = Delta.pnl(key, sec); Delta.pnlErr = ""; return r }
-                          catch (e2: Exception) { Delta.pnlErr = e2.message ?: e2.javaClass.simpleName; return null }
+                          try { val r = Delta.pnl(key, sec, "", "", mode, fee, rate); setErr(""); return r }
+                          catch (e2: Exception) { setErr(e2.message ?: e2.javaClass.simpleName); return null }
                       }
-                      Delta.pnlErr = e.message ?: e.javaClass.simpleName
+                      setErr(e.message ?: e.javaClass.simpleName)
                       return null
                   }
               }
-          
+
+              /** Writes one account's PnL and position count into the given text views. */
+              private fun showPnl(rv: RemoteViews, pnlId: Int, posId: Int, pnl: Pair<Double, Int>?, err: String) {
+                  val L = Locale.US
+                  val ts = Prefs.tsize(this).toFloat()
+                  rv.setTextViewTextSize(pnlId, TypedValue.COMPLEX_UNIT_SP, ts + 2f)
+                  rv.setTextViewTextSize(posId, TypedValue.COMPLEX_UNIT_SP, ts)
+                  if (pnl == null) {
+                      rv.setTextViewText(pnlId, "PnL: " + err.ifEmpty { "--" }); rv.setTextColor(pnlId, 0xFFAAAAAA.toInt())
+                      rv.setTextViewText(posId, "Pos --")
+                  } else {
+                      val rate = Prefs.rate(this)
+                      val v = if (rate > 0) pnl.first * rate else pnl.first
+                      val sym = if (rate > 0) "\u20B9" else "$"
+                      rv.setTextViewText(pnlId, String.format(L, "PnL %s%s%,.2f", if (v < 0) "-" else "+", sym, Math.abs(v)))
+                      rv.setTextColor(pnlId, if (v >= 0) 0xFF4CD964.toInt() else 0xFFFF5A5F.toInt())
+                      rv.setTextViewText(posId, "Pos ${pnl.second}")
+                  }
+              }
+
               private fun <T> Future<T?>.res(): T? = try { get(6, TimeUnit.SECONDS) } catch (_: Exception) { null }
-          
+
               private fun update(rv: RemoteViews) = AppWidgetManager.getInstance(this).partiallyUpdateAppWidget(ids(), rv)
-          
+
               /** BTC price + PnL + positions. Repeats as fast as Delta answers. */
               private fun fastTick() {
                   val key = Prefs.str(this, "key"); val sec = Prefs.str(this, "secret")
@@ -699,24 +1160,20 @@ jobs:
                   val rv = RemoteViews(packageName, R.layout.widget)
                   val L = Locale.US
                   rv.setInt(R.id.bg, "setImageAlpha", Prefs.alpha(this))
-                  val ts = Prefs.tsize(this).toFloat()
-                  rv.setTextViewTextSize(R.id.pnl, TypedValue.COMPLEX_UNIT_SP, ts + 2f)
-                  rv.setTextViewTextSize(R.id.pos, TypedValue.COMPLEX_UNIT_SP, ts)
                   rv.setTextViewText(R.id.price, if (price == null) "BTC --" else String.format(L, "BTC %,.1f", price))
-                  if (pnl == null) {
-                      rv.setTextViewText(R.id.pnl, "PnL: " + Delta.pnlErr.ifEmpty { "--" }); rv.setTextColor(R.id.pnl, 0xFFAAAAAA.toInt())
-                      rv.setTextViewText(R.id.pos, "Pos --")
-                  } else {
-                      val rate = Prefs.rate(this)
-                      val v = if (rate > 0) pnl.first * rate else pnl.first
-                      val sym = if (rate > 0) "\u20B9" else "$"
-                      rv.setTextViewText(R.id.pnl, String.format(L, "PnL %s%s%,.2f", if (v < 0) "-" else "+", sym, Math.abs(v)))
-                      rv.setTextColor(R.id.pnl, if (v >= 0) 0xFF4CD964.toInt() else 0xFFFF5A5F.toInt())
-                      rv.setTextViewText(R.id.pos, "Pos ${pnl.second}")
-                  }
+                  showPnl(rv, R.id.pnl, R.id.pos, pnl, Delta.pnlErr)
                   update(rv)
               }
-          
+
+              /** Secure Folder account PnL (own loop, every second like the old Secure Folder widget, so it never slows the main PnL). */
+              private fun sfTick() {
+                  val pnl2 = fetchPnl(Prefs.str(this, "key2"), Prefs.str(this, "secret2"),
+                      Prefs.str(this, "relay2"), Prefs.str(this, "rtoken2"), "2")
+                  val rv = RemoteViews(packageName, R.layout.widget)
+                  showPnl(rv, R.id.pnl2, R.id.pos2, pnl2, pnlErr2)
+                  update(rv)
+              }
+
               /** ADX for the chosen timeframes. */
               private fun adxTick() {
                   val tfs = Prefs.tfs(this)
@@ -728,31 +1185,18 @@ jobs:
                       if (v == null) "$tf --" else String.format(Locale.US, "%s %.1f", tf, v) })
                   update(rv)
               }
-          
-              /** ETH / GOLD / NIFTY and the 3 custom slots. */
+
+              /** Nifty next to BTC; Gold, Silver and Gift are polled too so their own previous-day record stays current. */
               private fun extraTick() {
-                  val extras = Prefs.extras(this)
+                  val specs = listOf("NIFTY", "GOLD", "SILVER", "GIFT")
+                  val x = specs.map { sp -> async { Delta.priceFor(sp) } }
+                  val vals = x.map { it.res() }
+                  specs.zip(vals).forEach { (sp, v) -> if (v != null) Prefs.refPrev(this, sp, v) }
                   val rv = RemoteViews(packageName, R.layout.widget)
-                  val rows = intArrayOf(R.id.more, R.id.more2, R.id.more3)
-                  if (extras.isEmpty()) { rows.forEach { rv.setViewVisibility(it, View.GONE) }; update(rv); return }
-                  val x = extras.map { (_, spec) -> async { Delta.priceFor(spec) } }
-                  val items = extras.zip(x.map { it.res() }).map { (e, v) ->
-                      val n = e.first
-                      if (v == null) "$n --"
-                      else if (Delta.isInr(e.second)) String.format(Locale.US, "%s \u20B9%,.0f", n, v)
-                      else String.format(Locale.US, "%s %,.1f", n, v)
-                  }
-                  val chunks = items.chunked(3)
-                  rows.forEachIndexed { i, id ->
-                      if (i < chunks.size) {
-                          rv.setViewVisibility(id, View.VISIBLE)
-                          rv.setTextViewTextSize(id, TypedValue.COMPLEX_UNIT_SP, Prefs.tsize(this).toFloat())
-                          rv.setTextViewText(id, chunks[i].joinToString(" | "))
-                      } else rv.setViewVisibility(id, View.GONE)
-                  }
+                  rv.setTextViewText(R.id.nifty, vals[0]?.let { String.format(Locale.US, "| Nifty %,.0f", it) } ?: "| Nifty --")
                   update(rv)
               }
-          
+
               override fun onDestroy() { loop.shutdownNow(); pool.shutdownNow(); super.onDestroy() }
           }
           END_OF_FILE_X
@@ -760,17 +1204,17 @@ jobs:
           mkdir -p 'app/src/main/java/com/btcwidget'
           cat > 'app/src/main/java/com/btcwidget/WidgetProvider.kt' <<'END_OF_FILE_X'
           package com.btcwidget
-          
+
           import android.appwidget.AppWidgetManager
           import android.appwidget.AppWidgetProvider
           import android.content.BroadcastReceiver
           import android.content.Context
           import android.content.Intent
-          
+
           class WidgetProvider : AppWidgetProvider() {
               override fun onUpdate(c: Context, m: AppWidgetManager, ids: IntArray) = start(c)
               override fun onEnabled(c: Context) = start(c)
-          
+
               override fun onReceive(c: Context, i: Intent) {
                   super.onReceive(c, i)
                   if (i.action == Prefs.ACTION_CYCLE) {
@@ -778,14 +1222,14 @@ jobs:
                       Prefs.sp(c).edit().putString("tf", next).apply()
                   }
               }
-          
+
               companion object {
                   fun start(c: Context) {
                       try { c.startForegroundService(Intent(c, UpdateService::class.java)) } catch (_: Exception) {}
                   }
               }
           }
-          
+
           class BootReceiver : BroadcastReceiver() {
               override fun onReceive(c: Context, i: Intent) = WidgetProvider.start(c)
           }
@@ -807,6 +1251,15 @@ jobs:
           </shape>
           END_OF_FILE_X
 
+          mkdir -p 'app/src/main/res/drawable'
+          cat > 'app/src/main/res/drawable/idx_btn.xml' <<'END_OF_FILE_X'
+          <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+              <solid android:color="#2E9E4F"/>
+              <stroke android:width="1dp" android:color="#7BD99A"/>
+              <corners android:radius="12dp"/>
+          </shape>
+          END_OF_FILE_X
+
           mkdir -p 'app/src/main/res/layout'
           cat > 'app/src/main/res/layout/widget.xml' <<'END_OF_FILE_X'
           <?xml version="1.0" encoding="utf-8"?>
@@ -818,21 +1271,15 @@ jobs:
                   android:orientation="vertical" android:padding="8dp">
                   <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
                       android:orientation="horizontal" android:gravity="center_vertical">
-                      <TextView android:id="@+id/price" android:layout_width="0dp" android:layout_height="wrap_content"
-                          android:layout_weight="1" android:text="BTC --" android:textColor="#FFFFFF"
+                      <TextView android:id="@+id/price" android:layout_width="wrap_content" android:layout_height="wrap_content"
+                          android:text="BTC --" android:textColor="#FFFFFF"
                           android:textSize="20sp" android:textStyle="bold" android:singleLine="true"/>
+                      <TextView android:id="@+id/nifty" android:layout_width="0dp" android:layout_height="wrap_content"
+                          android:layout_weight="1" android:layout_marginStart="8dp" android:text="| Nifty --"
+                          android:textColor="#FFFFFF" android:textSize="20sp" android:textStyle="bold" android:singleLine="true"/>
                       <ImageView android:id="@+id/gear" android:layout_width="24dp" android:layout_height="24dp"
                           android:src="@android:drawable/ic_menu_preferences"/>
                   </LinearLayout>
-                  <TextView android:id="@+id/more" android:layout_width="match_parent" android:layout_height="wrap_content"
-                      android:text="" android:textColor="#E6EBF0" android:textSize="15sp" android:textStyle="bold"
-                      android:maxLines="1" android:ellipsize="end"/>
-                  <TextView android:id="@+id/more2" android:layout_width="match_parent" android:layout_height="wrap_content"
-                      android:text="" android:textColor="#E6EBF0" android:textSize="15sp" android:textStyle="bold"
-                      android:maxLines="1" android:ellipsize="end"/>
-                  <TextView android:id="@+id/more3" android:layout_width="match_parent" android:layout_height="wrap_content"
-                      android:text="" android:textColor="#E6EBF0" android:textSize="15sp" android:textStyle="bold"
-                      android:maxLines="1" android:ellipsize="end"/>
                   <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
                       android:orientation="horizontal" android:gravity="center_vertical">
                       <TextView android:id="@+id/pnl" android:layout_width="wrap_content" android:layout_height="wrap_content"
@@ -842,40 +1289,64 @@ jobs:
                       <TextView android:id="@+id/pos" android:layout_width="wrap_content" android:layout_height="wrap_content"
                           android:layout_marginStart="12dp" android:text="Pos --" android:textColor="#FFFFFF"
                           android:textSize="15sp" android:textStyle="bold" android:singleLine="true"/>
+                      <TextView android:id="@+id/idxbtn" android:layout_width="wrap_content" android:layout_height="wrap_content"
+                          android:layout_marginStart="14dp" android:paddingLeft="12dp" android:paddingRight="12dp"
+                          android:paddingTop="3dp" android:paddingBottom="3dp" android:background="@drawable/idx_btn"
+                          android:text="INDICES" android:textColor="#FFFFFF" android:textSize="12sp" android:textStyle="bold"
+                          android:singleLine="true"/>
+                  </LinearLayout>
+                  <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+                      android:orientation="horizontal" android:gravity="center_vertical">
+                      <TextView android:id="@+id/pnl2" android:layout_width="wrap_content" android:layout_height="wrap_content"
+                          android:text="PnL --" android:textColor="#AAAAAA" android:textSize="17sp"
+                          android:textStyle="bold" android:fontFamily="sans-serif-black"
+                          android:singleLine="true" android:ellipsize="end"/>
+                      <TextView android:id="@+id/pos2" android:layout_width="wrap_content" android:layout_height="wrap_content"
+                          android:layout_marginStart="12dp" android:text="Pos --" android:textColor="#FFFFFF"
+                          android:textSize="15sp" android:textStyle="bold" android:singleLine="true"/>
                   </LinearLayout>
                   <TextView android:id="@+id/adx" android:layout_width="match_parent" android:layout_height="wrap_content"
                       android:paddingTop="2dp" android:paddingBottom="2dp"
                       android:text="ADX --" android:textColor="#E6EBF0" android:textSize="15sp" android:textStyle="bold"
                       android:maxLines="2" android:ellipsize="end"/>
-                  <LinearLayout android:id="@+id/row1" android:layout_width="match_parent" android:layout_height="wrap_content"
-                      android:layout_marginTop="3dp" android:orientation="horizontal" android:gravity="center_vertical">
-                      <ImageView android:id="@+id/btn1" android:layout_width="0dp" android:layout_height="52dp"
-                          android:layout_weight="1" android:padding="3dp"/>
-                      <ImageView android:id="@+id/btn2" android:layout_width="0dp" android:layout_height="52dp"
-                          android:layout_weight="1" android:padding="3dp"/>
-                      <ImageView android:id="@+id/btn3" android:layout_width="0dp" android:layout_height="52dp"
-                          android:layout_weight="1" android:padding="3dp"/>
-                      <ImageView android:id="@+id/btn4" android:layout_width="0dp" android:layout_height="52dp"
-                          android:layout_weight="1" android:padding="3dp"/>
-                      <ImageView android:id="@+id/btn5" android:layout_width="0dp" android:layout_height="52dp"
-                          android:layout_weight="1" android:padding="3dp"/>
-                      <ImageView android:id="@+id/btn6" android:layout_width="0dp" android:layout_height="52dp"
-                          android:layout_weight="1" android:padding="3dp"/>
+                  <LinearLayout android:id="@+id/row1" android:layout_width="match_parent" android:layout_height="44dp"
+                      android:layout_marginTop="1dp" android:orientation="horizontal" android:gravity="center">
+                      <ImageView android:id="@+id/btn1" android:layout_width="44dp" android:layout_height="match_parent"
+                          android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
+                      <ImageView android:id="@+id/btn2" android:layout_width="44dp" android:layout_height="match_parent"
+                          android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
+                      <ImageView android:id="@+id/btn3" android:layout_width="44dp" android:layout_height="match_parent"
+                          android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
+                      <ImageView android:id="@+id/btn4" android:layout_width="44dp" android:layout_height="match_parent"
+                          android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
+                      <ImageView android:id="@+id/btn5" android:layout_width="44dp" android:layout_height="match_parent"
+                          android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
+                      <ImageView android:id="@+id/btn6" android:layout_width="44dp" android:layout_height="match_parent"
+                          android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
                   </LinearLayout>
-                  <LinearLayout android:id="@+id/row2" android:layout_width="match_parent" android:layout_height="wrap_content"
-                      android:layout_marginTop="4dp" android:orientation="horizontal" android:gravity="center_vertical">
-                      <ImageView android:id="@+id/btn7" android:layout_width="0dp" android:layout_height="52dp"
-                          android:layout_weight="1" android:padding="3dp"/>
-                      <ImageView android:id="@+id/btn8" android:layout_width="0dp" android:layout_height="52dp"
-                          android:layout_weight="1" android:padding="3dp"/>
-                      <ImageView android:id="@+id/btn9" android:layout_width="0dp" android:layout_height="52dp"
-                          android:layout_weight="1" android:padding="3dp"/>
-                      <ImageView android:id="@+id/btn10" android:layout_width="0dp" android:layout_height="52dp"
-                          android:layout_weight="1" android:padding="3dp"/>
-                      <ImageView android:id="@+id/btn11" android:layout_width="0dp" android:layout_height="52dp"
-                          android:layout_weight="1" android:padding="3dp"/>
-                      <ImageView android:id="@+id/btn12" android:layout_width="0dp" android:layout_height="52dp"
-                          android:layout_weight="1" android:padding="3dp"/>
+                  <LinearLayout android:id="@+id/row2" android:layout_width="match_parent" android:layout_height="44dp"
+                      android:layout_marginTop="3dp" android:orientation="horizontal" android:gravity="center">
+                      <ImageView android:id="@+id/btn7" android:layout_width="44dp" android:layout_height="match_parent"
+                          android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
+                      <ImageView android:id="@+id/btn8" android:layout_width="44dp" android:layout_height="match_parent"
+                          android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
+                      <ImageView android:id="@+id/btn9" android:layout_width="44dp" android:layout_height="match_parent"
+                          android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
+                      <ImageView android:id="@+id/btn10" android:layout_width="44dp" android:layout_height="match_parent"
+                          android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
+                      <ImageView android:id="@+id/btn11" android:layout_width="44dp" android:layout_height="match_parent"
+                          android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
+                      <ImageView android:id="@+id/btn12" android:layout_width="44dp" android:layout_height="match_parent"
+                          android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
+                  </LinearLayout>
+                  <LinearLayout android:id="@+id/row3" android:layout_width="match_parent" android:layout_height="44dp"
+                      android:layout_marginTop="3dp" android:orientation="horizontal" android:gravity="center">
+                      <ImageView android:id="@+id/sf1" android:layout_width="44dp" android:layout_height="match_parent"
+                          android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
+                      <ImageView android:id="@+id/sf2" android:layout_width="44dp" android:layout_height="match_parent"
+                          android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
+                      <ImageView android:id="@+id/sf3" android:layout_width="44dp" android:layout_height="match_parent"
+                          android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
                   </LinearLayout>
               </LinearLayout>
           </FrameLayout>
@@ -883,13 +1354,13 @@ jobs:
 
           mkdir -p 'app/src/main/res/values'
           cat > 'app/src/main/res/values/strings.xml' <<'END_OF_FILE_X'
-          <resources><string name="app_name">BTC Widget</string></resources>
+          <resources><string name="app_name">Merged App</string></resources>
           END_OF_FILE_X
 
           mkdir -p 'app/src/main/res/xml'
           cat > 'app/src/main/res/xml/widget_info.xml' <<'END_OF_FILE_X'
           <appwidget-provider xmlns:android="http://schemas.android.com/apk/res/android"
-              android:minWidth="250dp" android:minHeight="180dp"
+              android:minWidth="250dp" android:minHeight="200dp"
               android:minResizeWidth="110dp" android:minResizeHeight="70dp"
               android:targetCellWidth="4" android:targetCellHeight="4"
               android:updatePeriodMillis="0"
@@ -921,7 +1392,7 @@ jobs:
           cat > 'settings.gradle.kts' <<'END_OF_FILE_X'
           pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
           dependencyResolutionManagement { repositories { google(); mavenCentral() } }
-          rootProject.name = "BtcWidget"
+          rootProject.name = "MergedApp"
           include(":app")
           END_OF_FILE_X
 
@@ -975,8 +1446,8 @@ jobs:
           +SK3wd+2llkbEWG0C9Tuu1lC3OQUbxZTifhwBBSd1YKBk5q92OTQoRwjRky18VEvMQICJxA=
           END_B64
       - name: Build
-        run: cd btc-widget && gradle assembleDebug -PverCode=${{ github.run_number }} --no-daemon
+        run: cd merged-app && gradle assembleDebug -PverCode=${{ github.run_number }} --no-daemon
       - uses: actions/upload-artifact@v4
         with:
-          name: btc-widget-apk
-          path: btc-widget/app/build/outputs/apk/debug/app-debug.apk
+          name: merged-app-apk
+          path: merged-app/app/build/outputs/apk/debug/app-debug.apk
