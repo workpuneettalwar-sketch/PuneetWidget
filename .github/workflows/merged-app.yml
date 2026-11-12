@@ -1,8 +1,8 @@
-name: Build Merged App
+name: Build Widget Phone
 on:
   push:
     paths:
-      - '.github/workflows/merged-app.yml'
+      - '.github/workflows/widget-phone.yml'
   workflow_dispatch:
 jobs:
   build:
@@ -19,7 +19,7 @@ jobs:
           gradle-version: 8.7
       - name: Create project files
         run: |
-          mkdir -p merged-app && cd merged-app
+          mkdir -p widget-phone && cd widget-phone
           mkdir -p 'app'
           cat > 'app/build.gradle.kts' <<'END_OF_FILE_X'
           plugins { id("com.android.application"); id("org.jetbrains.kotlin.android") }
@@ -68,6 +68,8 @@ jobs:
                   </activity>
                   <activity android:name=".IndexActivity" android:exported="false"
                       android:theme="@android:style/Theme.DeviceDefault.Dialog" android:label="Indices"/>
+                  <activity android:name=".ChartLaunch" android:exported="false" android:excludeFromRecents="true"
+                      android:noHistory="true" android:taskAffinity="" android:theme="@android:style/Theme.NoDisplay"/>
                   <activity android:name=".SfLaunch" android:exported="false" android:excludeFromRecents="true"
                       android:noHistory="true" android:taskAffinity="" android:theme="@android:style/Theme.NoDisplay"/>
                   <receiver android:name=".WidgetProvider" android:exported="true">
@@ -800,6 +802,26 @@ jobs:
                   finish()
               }
           }
+
+          /** Invisible screen behind the widget's CHART button: opens the link saved in settings. */
+          class ChartLaunch : Activity() {
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  var link = Prefs.str(this, "chartlink").trim()
+                  if (link.isEmpty()) {
+                      Toast.makeText(applicationContext, "Add the chart link in widget settings", Toast.LENGTH_LONG).show()
+                      startActivity(Intent(this, SettingsActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                  } else {
+                      if (!link.contains("://")) link = "https://$link"
+                      try {
+                          startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse(link)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                      } catch (e: Exception) {
+                          Toast.makeText(applicationContext, "Could not open link: " + (e.message ?: e.javaClass.simpleName), Toast.LENGTH_LONG).show()
+                      }
+                  }
+                  finish()
+              }
+          }
           END_OF_FILE_X
 
           mkdir -p 'app/src/main/java/com/btcwidget'
@@ -851,6 +873,7 @@ jobs:
                   field("rtoken", "Relay token")
                   field("key", "Delta API key (read-only; optional backup if relay is down)")
                   field("secret", "Delta API secret (optional backup)")
+                  field("chartlink", "CHART button link: paste the link of the chart you want (e.g. a TradingView or Delta chart link)")
                   label("Extra prices for the INDICES pop-up (3 slots): a name and a symbol. Symbols: SOLUSD (Delta), idx:nifty-bank idx:sensex (angelone.in/indices/<name>), yahoo:^NSEBANK, bullions:mcx bullions:24k bullions:22k bullions:silver")
                   for (i in 1..3) {
                       field("c${i}l", "Index $i name (e.g. BANKNIFTY)")
@@ -1097,6 +1120,8 @@ jobs:
                   rv.setViewVisibility(R.id.row3, if (sfs.any { it.isNotEmpty() }) View.VISIBLE else View.GONE)
                   rv.setOnClickPendingIntent(R.id.idxbtn, PendingIntent.getActivity(this, 4,
                       Intent(this, IndexActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK), PendingIntent.FLAG_IMMUTABLE))
+                  rv.setOnClickPendingIntent(R.id.chartbtn, PendingIntent.getActivity(this, 5,
+                      Intent(this, ChartLaunch::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK), PendingIntent.FLAG_IMMUTABLE))
                   rv.setOnClickPendingIntent(R.id.gear, PendingIntent.getActivity(this, 3,
                       Intent(this, SettingsActivity::class.java), PendingIntent.FLAG_IMMUTABLE))
                   AppWidgetManager.getInstance(this).updateAppWidget(ids(), rv)
@@ -1282,6 +1307,11 @@ jobs:
                   </LinearLayout>
                   <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
                       android:orientation="horizontal" android:gravity="center_vertical">
+                      <TextView android:id="@+id/idxbtn" android:layout_width="84dp" android:layout_height="wrap_content"
+                          android:layout_marginEnd="12dp" android:gravity="center"
+                          android:paddingTop="3dp" android:paddingBottom="3dp" android:background="@drawable/idx_btn"
+                          android:text="INDICES" android:textColor="#FFFFFF" android:textSize="12sp" android:textStyle="bold"
+                          android:singleLine="true"/>
                       <TextView android:id="@+id/pnl" android:layout_width="wrap_content" android:layout_height="wrap_content"
                           android:text="PnL --" android:textColor="#AAAAAA" android:textSize="17sp"
                           android:textStyle="bold" android:fontFamily="sans-serif-black"
@@ -1289,14 +1319,14 @@ jobs:
                       <TextView android:id="@+id/pos" android:layout_width="wrap_content" android:layout_height="wrap_content"
                           android:layout_marginStart="12dp" android:text="Pos --" android:textColor="#FFFFFF"
                           android:textSize="15sp" android:textStyle="bold" android:singleLine="true"/>
-                      <TextView android:id="@+id/idxbtn" android:layout_width="wrap_content" android:layout_height="wrap_content"
-                          android:layout_marginStart="14dp" android:paddingLeft="12dp" android:paddingRight="12dp"
-                          android:paddingTop="3dp" android:paddingBottom="3dp" android:background="@drawable/idx_btn"
-                          android:text="INDICES" android:textColor="#FFFFFF" android:textSize="12sp" android:textStyle="bold"
-                          android:singleLine="true"/>
                   </LinearLayout>
                   <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
                       android:orientation="horizontal" android:gravity="center_vertical">
+                      <TextView android:id="@+id/chartbtn" android:layout_width="84dp" android:layout_height="wrap_content"
+                          android:layout_marginEnd="12dp" android:gravity="center"
+                          android:paddingTop="3dp" android:paddingBottom="3dp" android:background="@drawable/idx_btn"
+                          android:text="CHART" android:textColor="#FFFFFF" android:textSize="12sp" android:textStyle="bold"
+                          android:singleLine="true"/>
                       <TextView android:id="@+id/pnl2" android:layout_width="wrap_content" android:layout_height="wrap_content"
                           android:text="PnL --" android:textColor="#AAAAAA" android:textSize="17sp"
                           android:textStyle="bold" android:fontFamily="sans-serif-black"
@@ -1354,7 +1384,7 @@ jobs:
 
           mkdir -p 'app/src/main/res/values'
           cat > 'app/src/main/res/values/strings.xml' <<'END_OF_FILE_X'
-          <resources><string name="app_name">Merged App</string></resources>
+          <resources><string name="app_name">Widget Phone</string></resources>
           END_OF_FILE_X
 
           mkdir -p 'app/src/main/res/xml'
@@ -1446,8 +1476,8 @@ jobs:
           +SK3wd+2llkbEWG0C9Tuu1lC3OQUbxZTifhwBBSd1YKBk5q92OTQoRwjRky18VEvMQICJxA=
           END_B64
       - name: Build
-        run: cd merged-app && gradle assembleDebug -PverCode=${{ github.run_number }} --no-daemon
+        run: cd widget-phone && gradle assembleDebug -PverCode=${{ github.run_number }} --no-daemon
       - uses: actions/upload-artifact@v4
         with:
-          name: merged-app-apk
-          path: merged-app/app/build/outputs/apk/debug/app-debug.apk
+          name: widget-phone-apk
+          path: widget-phone/app/build/outputs/apk/debug/app-debug.apk
