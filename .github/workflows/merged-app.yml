@@ -1,8 +1,6 @@
 name: Build Widget Phone
 on:
   push:
-    paths:
-      - '.github/workflows/widget-phone.yml'
   workflow_dispatch:
 jobs:
   build:
@@ -1476,7 +1474,11 @@ jobs:
           +SK3wd+2llkbEWG0C9Tuu1lC3OQUbxZTifhwBBSd1YKBk5q92OTQoRwjRky18VEvMQICJxA=
           END_B64
       - name: Build
-        run: cd widget-phone && gradle assembleDebug -PverCode=${{ github.run_number }} --no-daemon
+        run: |
+          # version number always higher than any earlier build (minutes since 1 Jan 2026), so it always installs as an update
+          VC=$(( ($(date +%s) - 1767225600) / 60 ))
+          echo "versionCode = $VC"
+          cd widget-phone && gradle assembleDebug -PverCode=$VC --no-daemon
       - uses: actions/upload-artifact@v4
         with:
           name: widget-phone-apk
