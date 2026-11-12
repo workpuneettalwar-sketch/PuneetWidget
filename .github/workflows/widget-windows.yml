@@ -1,0 +1,1454 @@
+name: Build Widget Windows
+on:
+  push:
+    paths:
+      - '.github/workflows/widget-windows.yml'
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Create source
+        run: |
+          cat > widget_windows.py <<'END_OF_FILE_X'
+          """Widget Windows - the laptop version of Widget Tablet (personal use). Python standard library only.
+
+          Left side : BTC | Nifty, PnL + positions of both Delta accounts, CHART / TT 1 / TT 2 buttons, ADX.
+          Right side: the index list, always open.
+          Drag the widget to move it, drag the corner mark to resize it, right-click (or the gear) for settings.
+          """
+          import gzip
+          import hashlib
+          import hmac
+          import json
+          import os
+          import queue
+          import re
+          import sys
+          import threading
+          import time
+          import tkinter as tk
+          import tkinter.font as tkfont
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          import webbrowser
+          from concurrent.futures import ThreadPoolExecutor
+          from datetime import datetime, timedelta, timezone
+
+          APP = "Widget Windows"
+          BASE = "https://api.india.delta.exchange"
+          SYMBOL = "BTCUSD"
+          TT_DEFAULT = "https://tradetron.tech/deployed-strategies"
+          DELTA_KEYS_PAGE = "https://india.delta.exchange/app/account/manageapikeys"
+          TFS = ["1m", "3m", "5m", "15m", "30m", "1h", "4h"]
+          SECS = {"1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "4h": 14400}
+          # same browser name the tablet app sends, so the price pages answer with the same layout
+          UA = "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36"
+          RUPEE = "\u20B9"
+          CUSTOM_SLOTS = 9          # the tablet's 3 + 6 more
+          MAX_ROWS = 13 + CUSTOM_SLOTS + 1
+
+          CFG_DIR = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"), "WidgetWindows")
+          CFG_FILE = os.path.join(CFG_DIR, "config.json")
+          REF_FILE = os.path.join(CFG_DIR, "prev-close.json")
+          LOG_FILE = os.path.join(CFG_DIR, "error.log")
+
+          STR_KEYS = (["relay", "rtoken", "key", "secret", "chartlink", "tt1link", "tt2link", "hide", "pnlsrc", "fee",
+                       "rate", "tfs", "key2", "secret2", "relay2", "rtoken2", "pnlsrc2", "fee2"]
+                      + ["c%dl" % i for i in range(1, CUSTOM_SLOTS + 1)]
+                      + ["c%ds" % i for i in range(1, CUSTOM_SLOTS + 1)])
+          INT_KEYS = {"alpha": (30, 100, 92), "tsize": (8, 40, 14), "isize": (7, 40, 11),
+                      "x": (-20000, 20000, 80), "y": (-20000, 20000, 80), "w": (0, 10000, 0), "h": (0, 10000, 0)}
+          BOOL_KEYS = {"topmost": False, "frameless": True}
+
+
+          # ---------------------------------------------------------------- settings file
+          def default_cfg():
+              cfg = {k: "" for k in STR_KEYS}
+              cfg.update({k: v[2] for k, v in INT_KEYS.items()})
+              cfg.update(BOOL_KEYS)
+              return cfg
+
+
+          def clean_cfg(saved):
+              """Known keys only, each with the right type and inside its range."""
+              cfg = default_cfg()
+              if not isinstance(saved, dict):
+                  return cfg
+              for k in STR_KEYS:
+                  if isinstance(saved.get(k), str):
+                      cfg[k] = saved[k].strip()
+              for k, (lo, hi, _) in INT_KEYS.items():
+                  try:
+                      cfg[k] = max(lo, min(hi, int(saved[k])))
+                  except Exception:
+                      pass
+              for k in BOOL_KEYS:
+                  if isinstance(saved.get(k), bool):
+                      cfg[k] = saved[k]
+              return cfg
+
+
+          def load_cfg():
+              try:
+                  with open(CFG_FILE, encoding="utf-8") as f:
+                      return clean_cfg(json.load(f))
+              except Exception:
+                  return default_cfg()
+
+
+          def write_json(path, data):
+              os.makedirs(os.path.dirname(path), exist_ok=True)
+              tmp = path + ".tmp"
+              with open(tmp, "w", encoding="utf-8") as f:
+                  json.dump(data, f, indent=2)
+              os.replace(tmp, path)
+
+
+          def save_cfg(cfg):
+              try:
+                  write_json(CFG_FILE, cfg)
+              except Exception:
+                  pass
+
+
+          def cfg_rate(cfg):
+              """Delta India's fixed USD-INR rate is 85. Blank = 85, 'usd' = show dollars (0), or any number."""
+              v = cfg.get("rate", "")
+              if not v:
+                  return 85.0
+              if v.lower() == "usd":
+                  return 0.0
+              try:
+                  return float(v)
+              except Exception:
+                  return 85.0
+
+
+          def cfg_tfs(cfg):
+              out = []
+              for t in cfg.get("tfs", "").split(","):
+                  t = t.strip()
+                  if t in TFS and t not in out:
+                      out.append(t)
+              return out[:4] or ["5m", "15m", "1h"]
+
+
+          INDEX = [("Nifty 50", "NIFTY"), ("Gift Nifty", "GIFT"), ("Midcap 100", "MIDCAP"), ("Smallcap 100", "SMALL"),
+                   ("India VIX", "VIX"), ("BTC", "BTC"), ("ETH", "ETH"), ("XAUUSD", "XAU"), ("Gold", "GOLD"),
+                   ("Silver", "SILVER"), ("Dow Jones", "DOW"), ("Nasdaq", "NASDAQ"), ("Crude Oil", "CRUDE")]
+
+
+          def index_list(cfg):
+              """Built-ins (minus the hidden ones), then the custom slots, then USD/INR."""
+              hide = {h.strip() for h in cfg.get("hide", "").upper().split(",") if h.strip()}
+              out = [r for r in INDEX if r[1] not in hide]
+              for i in range(1, CUSTOM_SLOTS + 1):
+                  sym = cfg.get("c%ds" % i, "")
+                  if sym:
+                      out.append((cfg.get("c%dl" % i, "") or sym.split(":", 1)[-1].upper(), sym))
+              if "USDINR" not in hide:
+                  out.append(("USD/INR", "USDINR"))
+              return out[:MAX_ROWS]
+
+
+          # ---------------------------------------------------------------- ADX
+          def adx_calc(h, l, c, n=14):
+              """Wilder ADX, including the currently forming candle. Returns the ADX or None."""
+              if len(c) < 2 * n + 1:
+                  return None
+              s_tr = s_p = s_m = 0.0
+              adx = 0.0
+              dx = []
+              for i in range(1, len(c)):
+                  up = h[i] - h[i - 1]
+                  dn = l[i - 1] - l[i]
+                  pdm = up if (up > dn and up > 0) else 0.0
+                  mdm = dn if (dn > up and dn > 0) else 0.0
+                  tr = max(h[i] - l[i], abs(h[i] - c[i - 1]), abs(l[i] - c[i - 1]))
+                  if i <= n:
+                      s_tr += tr
+                      s_p += pdm
+                      s_m += mdm
+                  else:
+                      s_tr = s_tr - s_tr / n + tr
+                      s_p = s_p - s_p / n + pdm
+                      s_m = s_m - s_m / n + mdm
+                  if i >= n:
+                      if s_tr <= 0:
+                          continue
+                      pdi = 100 * s_p / s_tr
+                      mdi = 100 * s_m / s_tr
+                      d = 100 * abs(pdi - mdi) / max(pdi + mdi, 1e-9)
+                      if len(dx) < n:
+                          dx.append(d)
+                          if len(dx) == n:
+                              adx = sum(dx) / n
+                      else:
+                          adx = (adx * (n - 1) + d) / n
+              return adx
+
+
+          # ---------------------------------------------------------------- internet
+          def _open(url, headers, timeout):
+              h = {"Accept-Encoding": "gzip"}
+              h.update(headers)
+              return urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=timeout)
+
+
+          def _body(resp):
+              data = resp.read()
+              if (resp.headers.get("Content-Encoding") or "").lower() == "gzip":
+                  data = gzip.decompress(data)
+              return data.decode("utf-8", "replace")
+
+
+          def num(o, k):
+              """Number stored under key k (given as a number or as text), else None."""
+              if not isinstance(o, dict):
+                  return None
+              v = o.get(k)
+              if v is None or isinstance(v, bool):
+                  return None
+              try:
+                  f = float(v)
+              except Exception:
+                  return None
+              return f if f == f else None
+
+
+          def api_get(path, query="", key=None, secret=None, url=None, token=None):
+              """Delta (or relay) request. Signed when a key is given; the relay uses its token instead."""
+              q = "?" + query if query else ""
+              headers = {"User-Agent": "widget-windows", "Accept": "application/json"}
+              if token is not None:
+                  headers["X-Token"] = token
+              elif key and secret:
+                  ts = str(int(time.time()))
+                  sig = hmac.new(secret.encode(), ("GET" + ts + path + q).encode(), hashlib.sha256).hexdigest()
+                  headers.update({"api-key": key, "timestamp": ts, "signature": sig})
+              try:
+                  with _open(url or (BASE + path + q), headers, 3) as r:
+                      code = r.status
+                      body = _body(r)
+              except urllib.error.HTTPError as e:
+                  code = e.code
+                  body = _body(e)
+              try:
+                  j = json.loads(body)
+              except Exception:
+                  raise RuntimeError("HTTP %s" % code)
+              if not isinstance(j, dict):
+                  raise RuntimeError("HTTP %s" % code)
+              if j.get("success", True) is False:
+                  e = j.get("error")
+                  if isinstance(e, dict):
+                      msg = str(e.get("code", ""))
+                      ctx = e.get("context")
+                      ip = re.search(r"\d{1,3}(\.\d{1,3}){3}", json.dumps(ctx) if isinstance(ctx, dict) else "")
+                      if ip:
+                          msg += " " + ip.group(0)   # the IP Delta wants whitelisted
+                  else:
+                      msg = str(e or "api error")
+                  raise RuntimeError(msg or "api error")
+              return j
+
+
+          def http_get(url, cookie=None, referer=None, timeout=3):
+              """Plain page / JSON download. Returns (text, cookies the site set)."""
+              headers = {"User-Agent": UA, "Accept": "application/json, text/html, */*", "Accept-Language": "en-US,en;q=0.9"}
+              if referer:
+                  headers["Referer"] = referer
+              if cookie:
+                  headers["Cookie"] = cookie
+              with _open(url, headers, timeout) as r:
+                  body = _body(r)
+                  ck = "; ".join(c.split(";")[0] for c in (r.headers.get_all("Set-Cookie") or []))
+              return body, ck
+
+
+          def page_text(html):
+              t = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", html)
+              t = re.sub(r"(?s)<[^>]+>", " ", t)
+              return t
+
+
+          class Feeds:
+              """Every price source of the tablet app, with the same order of fallbacks."""
+
+              def __init__(self):
+                  self.tl = threading.local()     # previous close reported by the source that just answered
+                  self.prev_map = {}              # spec -> previous close
+                  self.dprev = {}
+                  self.yprev = {}
+                  self.aprev = {}
+                  self.nse_prev = {}
+                  self.icache = {}
+                  self.ycache = {}
+                  self.nse_ck = None
+                  self.nse_data = None
+                  self.b_page = None
+                  self.bad_until = {}
+
+              def _set_prev(self, v):
+                  self.tl.prev = v
+
+              def _get_prev(self):
+                  return getattr(self.tl, "prev", None)
+
+              # ---- Delta
+              def mark(self, sym):
+                  r = api_get("/v2/tickers/" + sym)["result"]
+                  m = float(r["mark_price"])
+                  pct = num(r, "mark_change_24h")
+                  if pct is not None and pct > -99.0:
+                      self.dprev[sym] = m / (1 + pct / 100.0)
+                  self._set_prev(self.dprev.get(sym))
+                  return m
+
+              # ---- Indian indices from angelone.in public pages (cached 3 s)
+              CHG_RE = re.compile(r"(\d{1,3}(?:,\d{2,3})*(?:\.\d+)?)\s*[+\-\u2212]\s*[\d,]+(?:\.\d+)?\s*\(")
+
+              def _index_parse(self, text):
+                  i = text.find("Price as of")
+                  if i > 0:
+                      ms = list(self.CHG_RE.finditer(text[max(0, i - 160):i]))
+                      if ms:
+                          try:
+                              return float(ms[-1].group(1).replace(",", ""))
+                          except Exception:
+                              pass
+                  m = self.CHG_RE.search(text)
+                  if m:
+                      try:
+                          return float(m.group(1).replace(",", ""))
+                      except Exception:
+                          pass
+                  return None
+
+              def index_price(self, slug):
+                  now = time.time()
+                  c = self.icache.get(slug)
+                  if c and now - c[0] < 3:
+                      self._set_prev(self.aprev.get(slug))
+                      return c[1]
+                  html = http_get("https://www.angelone.in/indices/" + slug, timeout=4)[0]
+                  t = re.sub(r"\s+", " ", page_text(html).replace("&nbsp;", " "))
+                  v = self._index_parse(t)
+                  if v is None:
+                      raise RuntimeError("price not found for " + slug)
+                  m = re.search(r"Previous\s*Close\D{0,12}([0-9][0-9,]*\.?[0-9]*)", t, re.I)
+                  if m:
+                      try:
+                          self.aprev[slug] = float(m.group(1).replace(",", ""))
+                      except Exception:
+                          pass
+                  self.icache[slug] = (now, v)
+                  self._set_prev(self.aprev.get(slug))
+                  return v
+
+              # ---- NSE website (real time, one request returns every index; needs a session cookie)
+              def _nse_cookie(self):
+                  now = time.time()
+                  c = self.nse_ck
+                  if c and now - c[0] < 240:
+                      return c[1]
+                  ck = http_get("https://www.nseindia.com/")[1]
+                  self.nse_ck = (now, ck)
+                  return ck
+
+              def _nse_indices(self):
+                  now = time.time()
+                  d = self.nse_data
+                  if d and now - d[0] < 0.9:
+                      return d[1]
+                  try:
+                      body = http_get("https://www.nseindia.com/api/allIndices", self._nse_cookie(), "https://www.nseindia.com/")[0]
+                  except Exception:
+                      self.nse_ck = None
+                      raise
+                  m = {}
+                  pm = {}
+                  for o in json.loads(body)["data"]:
+                      name = str(o.get("index", "")).upper()
+                      v = num(o, "last")
+                      pc = num(o, "previousClose")
+                      if v is not None:
+                          m[name] = v
+                      if pc is not None and pc > 0:
+                          pm[name] = pc
+                  self.nse_prev = pm
+                  self.nse_data = (now, m)
+                  return m
+
+              def nse_idx(self, name):
+                  v = self._nse_indices().get(name)
+                  if v is None:
+                      raise RuntimeError(name + " not in NSE data")
+                  self._set_prev(self.nse_prev.get(name))
+                  return v
+
+              def nse_gift(self):
+                  try:
+                      body = http_get("https://www.nseindia.com/api/NextApi/apiClient?functionName=getGiftNifty",
+                                      self._nse_cookie(), "https://www.nseindia.com/")[0]
+                  except Exception:
+                      self.nse_ck = None
+                      raise
+                  m = re.search(r'"(?:LASTPRICE|lastPrice|LastTradedPrice|last)"\s*:\s*"?([0-9][0-9,]*\.?[0-9]*)', body, re.I)
+                  if not m:
+                      raise RuntimeError("gift price not in NSE reply")
+                  return float(m.group(1).replace(",", ""))
+
+              # ---- Yahoo Finance (unofficial, no key; cached 1 s)
+              def yahoo(self, sym):
+                  now = time.time()
+                  c = self.ycache.get(sym)
+                  if c and now - c[0] < 1:
+                      self._set_prev(self.yprev.get(sym))
+                      return c[1]
+                  u = ("https://query1.finance.yahoo.com/v8/finance/chart/" + urllib.parse.quote(sym, safe="")
+                       + "?interval=1d&range=5d")
+                  res = json.loads(http_get(u)[0])["chart"]["result"][0]
+                  meta = res["meta"]
+                  v = float(meta["regularMarketPrice"])
+                  # previous close from daily bars: if the newest bar is the session still in progress (started < 23 h
+                  # before the latest quote), the previous close is the bar before it; otherwise it is the newest bar
+                  try:
+                      rmt = int(meta["regularMarketTime"])
+                      ts = res["timestamp"]
+                      cl = res["indicators"]["quote"][0]["close"]
+                      last = len(ts) - 1
+                      i = last - 1 if rmt - int(ts[last]) < 23 * 3600 else last
+                      while i >= 0 and cl[i] is None:
+                          i -= 1
+                      if i >= 0 and float(cl[i]) > 0:
+                          self.yprev[sym] = float(cl[i])
+                  except Exception:
+                      pass
+                  self._set_prev(self.yprev.get(sym))
+                  self.ycache[sym] = (now, v)
+                  return v
+
+              # ---- bullions.co.in (read from the public web page; refreshed at most every 10 s)
+              NUM_RE = re.compile(r"\d{1,3}(?:,\d{2,3})+(?:\.\d+)?|\d{4,}(?:\.\d+)?")
+              BSPECS = {
+                  "mcx": (re.compile(r"Gold\W{1,6}India\W{1,4}MCX", re.I), 30000.0, 1000000.0),
+                  "24k": (re.compile(r"Gold\W{1,4}24\W{0,3}(?:Karat|K)", re.I), 30000.0, 1000000.0),
+                  "22k": (re.compile(r"Gold\W{1,4}22\W{0,3}(?:Karat|K)", re.I), 30000.0, 1000000.0),
+                  "silver": (re.compile(r"Silver\W{1,6}India\W{1,4}MCX", re.I), 30000.0, 5000000.0),
+              }
+
+              def _bullions_text(self):
+                  now = time.time()
+                  p = self.b_page
+                  if p and now - p[0] < 10:
+                      return p[1]
+                  html = http_get("https://bullions.co.in/", timeout=4)[0]
+                  t = page_text(html).replace("&nbsp;", " ").replace("&#8377;", " ").replace("&amp;", "&")
+                  t = re.sub(r"\s+", " ", t)
+                  self.b_page = (now, t)
+                  return t
+
+              def _bullions_value(self, text, spec):
+                  label, lo, hi = spec
+                  for m in label.finditer(text):
+                      for n in self.NUM_RE.finditer(text[m.end():m.end() + 399]):
+                          try:
+                              v = float(n.group(0).replace(",", ""))
+                          except Exception:
+                              continue
+                          if lo <= v <= hi:
+                              return v
+                  return None
+
+              def bullion(self, kind):
+                  spec = self.BSPECS.get(kind.lower())
+                  if spec is None:
+                      raise RuntimeError("unknown bullions:" + kind)
+                  v = self._bullions_value(self._bullions_text(), spec)
+                  if v is None:
+                      raise RuntimeError("not found on bullions.co.in")
+                  return v
+
+              def bullions_debug(self):
+                  text = self._bullions_text()
+                  out = []
+                  for k, spec in self.BSPECS.items():
+                      v = self._bullions_value(text, spec)
+                      out.append("bullions:%s -> %s" % (k, "NOT FOUND" if v is None else v))
+                      if v is None:
+                          m = spec[0].search(text)
+                          out.append("   text near label: " + ("label not on page" if m is None else text[m.start():m.end() + 159]))
+                  return "\n".join(out)
+
+              # ---- which sources serve which name
+              def sources(self, spec):
+                  """Ordered list of (source name, function) for a spec; the first one that answers wins."""
+                  s = spec.strip()
+                  low = s.lower()
+                  up = s.upper()
+                  f = self
+                  table = {
+                      "BTC": [("Delta", lambda: f.mark("BTCUSD"))],
+                      "NASDAQ": [("Yahoo", lambda: f.yahoo("^IXIC"))],
+                      "DOW": [("Yahoo", lambda: f.yahoo("^DJI"))],
+                      "CRUDE": [("Yahoo", lambda: f.yahoo("CL=F"))],
+                      "ETH": [("Delta", lambda: f.mark("ETHUSD"))],
+                      "GOLD": [("bullions", lambda: f.bullion("24k"))],
+                      "SILVER": [("bullions", lambda: f.bullion("silver"))],
+                      "NIFTY": [("NSE", lambda: f.nse_idx("NIFTY 50")), ("Yahoo", lambda: f.yahoo("^NSEI")),
+                                ("Angel", lambda: f.index_price("nifty-50"))],
+                      "MIDCAP": [("NSE", lambda: f.nse_idx("NIFTY MIDCAP 100")), ("Yahoo", lambda: f.yahoo("NIFTY_MIDCAP_100.NS")),
+                                 ("Angel", lambda: f.index_price("nifty-midcap-100"))],
+                      "SMALL": [("NSE", lambda: f.nse_idx("NIFTY SMALLCAP 100")), ("Yahoo", lambda: f.yahoo("^CNXSC")),
+                                ("Angel", lambda: f.index_price("nifty-smallcap-100"))],
+                      "VIX": [("NSE", lambda: f.nse_idx("INDIA VIX")), ("Yahoo", lambda: f.yahoo("^INDIAVIX")),
+                              ("Angel", lambda: f.index_price("india-vix"))],
+                      "GIFT": [("NSE", f.nse_gift), ("Angel", lambda: f.index_price("gift-nifty"))],
+                      "XAU": [("Delta", lambda: f.mark("XAUUSD")), ("Yahoo", lambda: f.yahoo("GC=F"))],
+                      "USDINR": [("Yahoo", lambda: f.yahoo("INR=X"))],
+                  }
+                  if up in table:
+                      return table[up]
+                  if low.startswith("bullions:"):
+                      return [("bullions", lambda: f.bullion(low[9:].strip()))]
+                  if low.startswith("delta:"):
+                      return [("Delta", lambda: f.mark(s[6:].strip().upper()))]
+                  if low.startswith("idx:"):
+                      return [("Angel", lambda: f.index_price(low[4:].strip()))]
+                  if low.startswith("yahoo:"):
+                      return [("Yahoo", lambda: f.yahoo(s[6:].strip()))]
+                  return [("Delta", lambda: f.mark(up))]
+
+              def quote(self, spec):
+                  """Price and the name of the source that gave it. A source that failed is skipped for 30 s."""
+                  lst = self.sources(spec)
+                  up = spec.upper()
+                  last = None
+                  for i, (name, fn) in enumerate(lst):
+                      key = up + ":" + name
+                      if self.bad_until.get(key, 0) > time.time() and i < len(lst) - 1:
+                          continue
+                      try:
+                          self._set_prev(None)
+                          v = fn()
+                          pv = self._get_prev()
+                          if pv is not None:
+                              self.prev_map[up] = pv
+                          else:
+                              self.prev_map.pop(up, None)
+                          return v, name
+                      except Exception as e:
+                          last = e
+                          self.bad_until[key] = time.time() + 30
+                  raise last or RuntimeError("no source for " + spec)
+
+              def prev_for(self, spec):
+                  """Previous close from the first source that has one."""
+                  for _, fn in self.sources(spec):
+                      try:
+                          self._set_prev(None)
+                          fn()
+                          pv = self._get_prev()
+                          if pv is not None and pv > 0:
+                              return pv
+                      except Exception:
+                          pass
+                  return None
+
+              def index_debug(self):
+                  """For the 'Test prices' button: every source of every built-in, tried one by one."""
+                  out = []
+                  for spec in ["NIFTY", "GOLD", "ETH", "SILVER", "MIDCAP", "SMALL", "GIFT", "VIX", "XAU", "NASDAQ", "DOW",
+                               "CRUDE", "USDINR"]:
+                      parts = []
+                      for name, fn in self.sources(spec):
+                          try:
+                              self._set_prev(None)
+                              v = fn()
+                              pv = self._get_prev()
+                              parts.append("%s=%.1f %s" % (name, v, "(no prev)" if pv is None else "(prev %.1f)" % pv))
+                          except Exception as e:
+                              parts.append("%s=ERR(%s)" % (name, (str(e) or type(e).__name__)[:40]))
+                      out.append(spec + ": " + "  ".join(parts))
+                  return "\n".join(out)
+
+              def candles(self, tf):
+                  now = int(time.time())
+                  r = api_get("/v2/history/candles", "resolution=%s&symbol=%s&start=%d&end=%d"
+                              % (tf, SYMBOL, now - SECS[tf] * 120, now))["result"]
+                  rows = sorted(r, key=lambda x: int(x["time"]))
+                  return ([float(x["high"]) for x in rows], [float(x["low"]) for x in rows], [float(x["close"]) for x in rows])
+
+
+          def is_inr(spec):
+              """Prices from bullions.co.in are in rupees: shown without decimals and with a rupee sign."""
+              s = spec.strip().lower()
+              return s in ("gold", "silver") or s.startswith("bullions:")
+
+
+          # ---------------------------------------------------------------- PnL
+          FETCH_POOL = ThreadPoolExecutor(max_workers=16)   # all option prices are requested at the same moment
+
+
+          def positions(relay, token, key, secret):
+              if relay:
+                  r = api_get("/positions", "", None, None, relay.rstrip("/") + "/positions", token)
+              else:
+                  r = api_get("/v2/positions/margined", "", key, secret)
+              res = r.get("result")
+              return res if isinstance(res, list) else []
+
+
+          def sym_of(p):
+              s = p.get("product_symbol") or ""
+              if not s and isinstance(p.get("product"), dict):
+                  s = p["product"].get("symbol") or ""
+              return str(s)
+
+
+          def recompute(p, size):
+              """Own calculation: size x contract_value x (mark - entry). None when an input is missing or implausible."""
+              entry = num(p, "entry_price")
+              if entry is None or entry <= 0.0:      # an entry of 0 would turn PnL into the position's full value
+                  return None
+              sym = sym_of(p)
+              if not sym:
+                  return None
+              t = api_get("/v2/tickers/" + sym)["result"]
+              cv = num(p.get("product"), "contract_value")
+              if cv is None:
+                  cv = num(t, "contract_value")
+              mark = num(t, "mark_price")
+              if cv is None or mark is None:
+                  return None
+              return size * cv * (mark - entry)
+
+
+          def fee_usd(p, fee, rate):
+              """fee: '' = none, 'auto' = the position's own commission field, number = rupees per open position."""
+              if not fee:
+                  return 0.0
+              if fee == "auto":
+                  return abs(num(p, "commission") or 0.0)
+              try:
+                  inr = float(fee)
+              except Exception:
+                  return 0.0
+              return inr / (rate if rate > 0 else 85.0)
+
+
+          def pick(api, own, mode):
+              """Delta's unrealized_pnl field is wrong for option positions, so the own calculation is the default.
+              Mode 'delta' prefers Delta's field."""
+              first, second = (api, own) if mode == "delta" else (own, api)
+              if first is not None:
+                  return first
+              return second if second is not None else 0.0
+
+
+          def _size(p):
+              return num(p, "size") or 0.0
+
+
+          def _try_recompute(p, size):
+              try:
+                  return recompute(p, size)
+              except Exception:
+                  return None
+
+
+          def pnl(key, secret, relay="", token="", mode="", fee="", rate=85.0):
+              """PnL (USD) and number of open positions."""
+              jobs = []
+              for p in positions(relay, token, key, secret):
+                  if not isinstance(p, dict):
+                      continue
+                  size = _size(p)
+                  if size == 0.0:
+                      continue
+                  jobs.append((p, FETCH_POOL.submit(_try_recompute, p, size)))
+              total = 0.0
+              for p, f in jobs:
+                  try:
+                      own = f.result(timeout=4)
+                  except Exception:
+                      own = None
+                  total += pick(num(p, "unrealized_pnl"), own, mode) - fee_usd(p, fee, rate)
+              return total, len(jobs)
+
+
+          def pnl_debug(key, secret, relay, token, rate, mode="", fee=""):
+              """Readable dump used by the 'Test PnL' buttons in settings."""
+              out = []
+              total = 0.0
+              n = 0
+              for p in positions(relay, token, key, secret):
+                  if not isinstance(p, dict):
+                      continue
+                  size = _size(p)
+                  if size == 0.0:
+                      continue
+                  n += 1
+                  api = num(p, "unrealized_pnl")
+                  own = _try_recompute(p, size)
+                  used = pick(api, own, mode)
+                  fee_v = fee_usd(p, fee, rate)
+                  out.append("%s  size=%s  entry=%s" % (sym_of(p), p.get("size"), p.get("entry_price")))
+                  out.append("  Delta unrealized_pnl: %s" % ("missing" if api is None else api))
+                  out.append("  own calculation: %s" % ("n/a" if own is None else own))
+                  out.append("  commission field: %s   fee applied: %.4f" % (p.get("commission", "missing"), fee_v))
+                  out.append("  used: %s   (Rs %.2f)" % (used, used * rate))
+                  total += used - fee_v
+              if n == 0:
+                  return "No open positions."
+              out.append("")
+              out.append("Total: USD %.4f  x %.2f = Rs %.2f" % (total, rate, total * rate))
+              return "\n".join(out)
+
+
+          def fetch_pnl(cfg, sfx=""):
+              """One account ('' = main, '2' = 2nd). Relay first (fixed IP); if it fails and a direct key is saved,
+              try direct. Returns ((usd, open positions) or None, error text)."""
+              key, sec = cfg["key" + sfx], cfg["secret" + sfx]
+              relay, rtok = cfg["relay" + sfx], cfg["rtoken" + sfx]
+              mode, fee = cfg["pnlsrc" + sfx].lower(), cfg["fee" + sfx].lower()
+              rate = cfg_rate(cfg)
+              direct = bool(key and sec)
+              if not relay and not direct:
+                  return None, ("add relay or API key in settings" if not sfx else "add 2nd account key in settings")
+              try:
+                  return pnl(key, sec, relay, rtok, mode, fee, rate), ""
+              except Exception as e:
+                  if relay and direct:
+                      try:
+                          return pnl(key, sec, "", "", mode, fee, rate), ""
+                      except Exception as e2:
+                          return None, str(e2) or type(e2).__name__
+                  return None, str(e) or type(e).__name__
+
+
+          # ---------------------------------------------------------------- own record of yesterday's last price
+          class Refs:
+              """Fallback when a source gives no previous close: the widget's own saved last price of the previous day."""
+
+              def __init__(self):
+                  self.lock = threading.Lock()
+                  self.saved = 0.0
+                  try:
+                      with open(REF_FILE, encoding="utf-8") as f:
+                          d = json.load(f)
+                      self.d = d if isinstance(d, dict) else {}
+                  except Exception:
+                      self.d = {}
+
+              @staticmethod
+              def today():
+                  return datetime.now(timezone(timedelta(hours=5, minutes=30))).strftime("%Y%m%d")   # India time
+
+              def prev(self, spec, price):
+                  k = spec.upper()
+                  day = self.today()
+                  with self.lock:
+                      st = self.d.get(k)
+                      if not isinstance(st, dict):
+                          st = self.d[k] = {"day": "", "last": 0.0, "prev": 0.0}
+                      now = time.time()
+                      save = now - self.saved > 30
+                      if st.get("day") != day:
+                          if (num(st, "last") or 0) > 0:
+                              st["prev"] = st["last"]
+                          st["day"] = day
+                          save = True
+                      st["last"] = price
+                      if save:
+                          self.saved = now
+                          try:
+                              write_json(REF_FILE, self.d)
+                          except Exception:
+                              pass
+                      pv = num(st, "prev") or 0.0
+                      return pv if pv > 0 else None
+
+
+          # ---------------------------------------------------------------- text shown on the widget
+          GREEN, RED, GREY, WHITE = "#4CD964", "#FF5A5F", "#AAAAAA", "#FFFFFF"
+
+
+          def fmt_pnl(res, err, rate):
+              """(PnL text, colour, positions text) for one account."""
+              if res is None:
+                  return "PnL: " + (err or "--"), GREY, "Pos --"
+              v = res[0] * rate if rate > 0 else res[0]
+              sym = RUPEE if rate > 0 else "$"
+              return ("PnL %s%s%s" % ("-" if v < 0 else "+", sym, "{:,.2f}".format(abs(v))),
+                      GREEN if v >= 0 else RED, "Pos %d" % res[1])
+
+
+          def fmt_price(spec, price):
+              if spec == "USDINR":
+                  return RUPEE + "%.2f" % price
+              if is_inr(spec):
+                  return RUPEE + "{:,.0f}".format(price)
+              return "{:,.0f}".format(price) if price >= 10000 else "{:,.1f}".format(price)
+
+
+          def fmt_change(spec, price, prev, own):
+              """(change text, colour). A * marks a change measured against the widget's own saved close."""
+              if prev is None or prev <= 0.0:
+                  return "n/a", GREY
+              diff = price - prev
+              pct = diff / prev * 100.0
+              if spec == "USDINR":
+                  pts = "%+.2f" % diff
+              elif abs(diff) >= 100:
+                  pts = "{:+,.0f}".format(diff)
+              else:
+                  pts = "{:+,.1f}".format(diff)
+              return "%s (%+.2f%%)%s" % (pts, pct, "*" if own else ""), (GREEN if diff >= 0 else RED)
+
+
+          def open_target(t):
+              """Opens a web link, or a program / file / folder when a path on this laptop is given."""
+              t = t.strip().strip('"')
+              if "://" in t:
+                  webbrowser.open(t)
+              elif os.path.exists(t):
+                  os.startfile(t)   # type: ignore[attr-defined]
+              else:
+                  webbrowser.open("https://" + t)
+
+
+          # ---------------------------------------------------------------- the window
+          BG, SEP, BTN, BTN_EDGE, ADX_FG = "#101418", "#40444A", "#2E9E4F", "#7BD99A", "#E6EBF0"
+          FONT = "Segoe UI"
+
+
+          class App:
+              def __init__(self):
+                  self.cfg = load_cfg()
+                  self.feeds = Feeds()
+                  self.refs = Refs()
+                  self.st = {"price": None, "pnl": (None, ""), "pnl2": (None, ""), "adx": "ADX --", "nifty": None}
+                  self.rows = {}            # spec -> (price, previous close, own record used) or None
+                  self.busy = set()
+                  self.busy_lock = threading.Lock()
+                  self.pool = ThreadPoolExecutor(max_workers=16)
+                  self.idx_pool = ThreadPoolExecutor(max_workers=12)   # own threads, so a slow price source never delays PnL
+                  self.uiq = queue.Queue()
+                  self.shown = {}
+                  self.settings = None
+                  self._frameless = None
+                  self._press_at = None
+                  self._grip_at = None
+                  self._dragged = False
+
+                  root = self.root = tk.Tk()
+                  root.title(APP)
+                  root.configure(bg=BG)
+                  try:
+                      self.scale = max(1.0, float(root.winfo_fpixels("1i")) / 96.0)
+                  except Exception:
+                      self.scale = 1.0
+                  self.f_big = tkfont.Font(family=FONT, size=17, weight="bold")
+                  self.f_pnl = tkfont.Font(family=FONT, size=15, weight="bold")
+                  self.f_txt = tkfont.Font(family=FONT, size=14, weight="bold")
+                  self.f_btn = tkfont.Font(family=FONT, size=10, weight="bold")
+                  self.f_idx = tkfont.Font(family=FONT, size=11)
+                  self.f_idxb = tkfont.Font(family=FONT, size=11, weight="bold")
+
+                  pad = int(10 * self.scale)
+                  outer = tk.Frame(root, bg=BG, padx=pad, pady=pad)
+                  outer.pack(fill="both", expand=True)
+                  outer.columnconfigure(0, weight=11, uniform="side")
+                  outer.columnconfigure(2, weight=10, uniform="side")
+                  outer.rowconfigure(0, weight=1)
+                  left = tk.Frame(outer, bg=BG)
+                  left.grid(row=0, column=0, sticky="nsew")
+                  tk.Frame(outer, bg=SEP, width=1).grid(row=0, column=1, sticky="ns", padx=pad)
+                  right = self.right = tk.Frame(outer, bg=BG)
+                  right.grid(row=0, column=2, sticky="nsew")
+
+                  # LEFT: prices, PnL of both accounts, CHART / TT 1 / TT 2, ADX
+                  r1 = tk.Frame(left, bg=BG)
+                  r1.pack(fill="x")
+                  self.l_price = self._label(r1, "BTC --", self.f_big, WHITE)
+                  self.l_price.pack(side="left")
+                  self.l_gear = self._label(r1, "\u2699", self.f_txt, GREY)
+                  self.l_gear.configure(cursor="hand2")
+                  self.l_gear.pack(side="right")
+                  self.l_gear.bind("<ButtonRelease-1>", lambda e: self._click(self.open_settings))
+                  self.l_nifty = self._label(r1, "| Nifty --", self.f_big, WHITE)
+                  self.l_nifty.pack(side="left", padx=(8, 0))
+                  r2 = tk.Frame(left, bg=BG)
+                  r2.pack(fill="x")
+                  self.l_pnl = self._label(r2, "PnL --", self.f_pnl, GREY)
+                  self.l_pnl.pack(side="left")
+                  self.l_pos = self._label(r2, "Pos --", self.f_txt, WHITE)
+                  self.l_pos.pack(side="left", padx=(12, 0))
+                  r3 = tk.Frame(left, bg=BG)
+                  r3.pack(fill="x")
+                  self.l_pnl2 = self._label(r3, "PnL --", self.f_pnl, GREY)
+                  self.l_pnl2.pack(side="left")
+                  self.l_pos2 = self._label(r3, "Pos --", self.f_txt, WHITE)
+                  self.l_pos2.pack(side="left", padx=(12, 0))
+                  r4 = tk.Frame(left, bg=BG)
+                  r4.pack(fill="x", pady=(6, 2))
+                  for col, (text, which) in enumerate([("CHART", "chart"), ("TT 1", "tt1"), ("TT 2", "tt2")]):
+                      r4.columnconfigure(col, weight=1, uniform="btn")
+                      b = tk.Label(r4, text=text, font=self.f_btn, bg=BTN, fg=WHITE, pady=3, cursor="hand2",
+                                   highlightthickness=1, highlightbackground=BTN_EDGE)
+                      b.grid(row=0, column=col, sticky="ew", padx=(0, 8 if col < 2 else 0))
+                      b.bind("<ButtonRelease-1>", lambda e, w=which: self._click(lambda: self.open_link(w)))
+                  self.l_adx = self._label(left, "ADX --", self.f_txt, ADX_FG)
+                  self.l_adx.configure(justify="left")
+                  self.l_adx.pack(fill="x", pady=(3, 0))
+                  left.bind("<Configure>", lambda e: self.l_adx.configure(wraplength=max(60, e.width)))
+
+                  # RIGHT: the index list, always open
+                  right.columnconfigure(0, weight=11, uniform="col")
+                  right.columnconfigure(1, weight=10, uniform="col")
+                  right.columnconfigure(2, weight=16, uniform="col")
+                  self.row_w = []
+                  self.row_on = []
+                  for i in range(MAX_ROWS):
+                      n = self._label(right, "", self.f_idxb, WHITE)
+                      p = self._label(right, "--", self.f_idx, WHITE, "e")
+                      c = self._label(right, "", self.f_idxb, GREY, "e")
+                      n.grid(row=i, column=0, sticky="ew")
+                      p.grid(row=i, column=1, sticky="ew")
+                      c.grid(row=i, column=2, sticky="ew")
+                      self.row_w.append((n, p, c))
+                      self.row_on.append(True)
+                      right.rowconfigure(i, weight=1, uniform="row")
+
+                  # corner mark for resizing (used when there is no title bar)
+                  self.grip = tk.Label(root, text="\u25E2", bg=BG, fg="#5A6068", cursor="size_nw_se", font=(FONT, 9))
+                  self.grip.bind("<ButtonPress-1>", self._grip_press)
+                  self.grip.bind("<B1-Motion>", self._grip_drag)
+                  self.grip.bind("<ButtonRelease-1>", self._grip_release)
+
+                  self.v_top = tk.BooleanVar(root, value=self.cfg["topmost"])
+                  self.v_frame = tk.BooleanVar(root, value=not self.cfg["frameless"])
+                  self.menu = tk.Menu(root, tearoff=0)
+                  self.menu.add_command(label="Settings", command=self.open_settings)
+                  self.menu.add_checkbutton(label="Always on top", variable=self.v_top, command=self._menu_toggle)
+                  self.menu.add_checkbutton(label="Show title bar", variable=self.v_frame, command=self._menu_toggle)
+                  self.menu.add_separator()
+                  self.menu.add_command(label="Exit", command=self.quit)
+                  root.bind("<Button-3>", self._popup)
+                  root.bind("<ButtonPress-1>", self._press)
+                  root.bind("<B1-Motion>", self._drag)
+                  root.bind("<ButtonRelease-1>", self._release)
+                  root.protocol("WM_DELETE_WINDOW", self.quit)
+
+                  self._place_window()
+                  self.apply_look()
+                  self._loop(self.fast_tick, 0.5)     # independent loops: a slow ADX / index request never delays the PnL
+                  self._loop(self.sf_tick, 1.0)
+                  self._loop(self.adx_tick, 1.5)
+                  self._loop(self.index_tick, 1.0)
+                  root.after(100, self._ui_tick)
+
+              @staticmethod
+              def _label(parent, text, font, fg, anchor="w"):
+                  return tk.Label(parent, text=text, font=font, bg=BG, fg=fg, anchor=anchor, padx=0, pady=0, bd=0)
+
+              # ---- window position, size and look
+              def _place_window(self):
+                  root, cfg = self.root, self.cfg
+                  w = cfg["w"] or int(860 * self.scale)
+                  h = cfg["h"] or int(360 * self.scale)
+                  x, y = cfg["x"], cfg["y"]
+                  try:      # keep it reachable if a second screen was unplugged
+                      vx, vy = root.winfo_vrootx(), root.winfo_vrooty()
+                      vw = max(root.winfo_vrootwidth(), root.winfo_screenwidth())
+                      vh = max(root.winfo_vrootheight(), root.winfo_screenheight())
+                      x = max(vx, min(x, vx + vw - 120))
+                      y = max(vy, min(y, vy + vh - 80))
+                  except Exception:
+                      pass
+                  root.geometry("%dx%d+%d+%d" % (w, h, x, y))
+
+              def _remember_window(self):
+                  try:
+                      m = re.match(r"(\d+)x(\d+)\+(-?\d+)\+(-?\d+)", self.root.geometry())
+                      if m:
+                          w, h, x, y = (int(g) for g in m.groups())
+                          self.cfg.update({"w": w, "h": h, "x": x, "y": y})
+                  except Exception:
+                      pass
+
+              def apply_look(self):
+                  root, cfg = self.root, self.cfg
+                  try:
+                      root.attributes("-alpha", max(0.3, min(1.0, cfg["alpha"] / 100.0)))
+                      root.attributes("-topmost", bool(cfg["topmost"]))
+                  except Exception:
+                      pass
+                  frameless = bool(cfg["frameless"])
+                  if frameless != self._frameless:
+                      first = self._frameless is None
+                      self._frameless = frameless
+                      try:
+                          if not first:
+                              root.withdraw()
+                          root.overrideredirect(frameless)
+                          if not first:
+                              root.deiconify()
+                      except Exception:
+                          pass
+                      if frameless:
+                          self.grip.place(relx=1.0, rely=1.0, anchor="se")
+                      else:
+                          self.grip.place_forget()
+                  ts, isz = cfg["tsize"], cfg["isize"]
+                  self.f_big.configure(size=ts + 3)
+                  self.f_pnl.configure(size=ts + 1)
+                  self.f_txt.configure(size=ts)
+                  self.f_btn.configure(size=max(8, int(round(ts * 0.7))))
+                  self.f_idx.configure(size=isz)
+                  self.f_idxb.configure(size=isz)
+                  self.v_top.set(bool(cfg["topmost"]))
+                  self.v_frame.set(not frameless)
+
+              def _menu_toggle(self):
+                  self.cfg["topmost"] = bool(self.v_top.get())
+                  self.cfg["frameless"] = not bool(self.v_frame.get())
+                  self.apply_look()
+                  save_cfg(self.cfg)
+
+              def _popup(self, e):
+                  try:
+                      self.menu.tk_popup(e.x_root, e.y_root)
+                  finally:
+                      self.menu.grab_release()
+
+              def _press(self, e):
+                  self._dragged = False
+                  self._press_at = (e.x_root, e.y_root, self.root.winfo_x(), self.root.winfo_y())
+
+              def _drag(self, e):
+                  if self._press_at is None or not self._frameless:
+                      return
+                  x0, y0, wx, wy = self._press_at
+                  dx, dy = e.x_root - x0, e.y_root - y0
+                  if abs(dx) + abs(dy) > 4:
+                      self._dragged = True
+                  if self._dragged:
+                      self.root.geometry("+%d+%d" % (wx + dx, wy + dy))
+
+              def _release(self, e):
+                  self._press_at = None
+                  if self._dragged:
+                      self._remember_window()
+                      save_cfg(self.cfg)
+
+              def _click(self, action):
+                  """Buttons react on release, and only when the press was not the start of a drag."""
+                  if not self._dragged:
+                      action()
+
+              def _grip_press(self, e):
+                  self._grip_at = (e.x_root, e.y_root, self.root.winfo_width(), self.root.winfo_height())
+                  return "break"
+
+              def _grip_drag(self, e):
+                  if self._grip_at is not None:
+                      x0, y0, w0, h0 = self._grip_at
+                      self.root.geometry("%dx%d" % (max(300, w0 + e.x_root - x0), max(140, h0 + e.y_root - y0)))
+                  return "break"
+
+              def _grip_release(self, e):
+                  self._grip_at = None
+                  self._remember_window()
+                  save_cfg(self.cfg)
+                  return "break"
+
+              def quit(self):
+                  self._remember_window()
+                  save_cfg(self.cfg)
+                  self.root.destroy()
+
+              # ---- buttons
+              def open_settings(self):
+                  if self.settings is not None and self.settings.alive():
+                      self.settings.win.lift()
+                      self.settings.win.focus_force()
+                      return
+                  self.settings = Settings(self)
+
+              def open_link(self, which):
+                  """CHART opens the saved chart link. TT 1 / TT 2 open their link or program (blank = Tradetron page)."""
+                  t = self.cfg["chartlink" if which == "chart" else which + "link"]
+                  if not t and which != "chart":
+                      t = TT_DEFAULT
+                  if not t:
+                      self.open_settings()
+                      self.show_text("CHART button", "Add the chart link in settings (the field named CHART button link).")
+                      return
+                  try:
+                      open_target(t)
+                  except Exception as e:
+                      self.show_text("Could not open", str(e) or type(e).__name__)
+
+              def show_text(self, title, text):
+                  win = tk.Toplevel(self.root)
+                  win.title(title)
+                  win.attributes("-topmost", True)
+                  box = tk.Text(win, width=84, height=min(30, max(6, text.count("\n") + 3)), wrap="word", font=("Consolas", 10))
+                  box.insert("1.0", text)
+                  box.configure(state="disabled")
+                  box.pack(fill="both", expand=True, padx=10, pady=(10, 4))
+                  tk.Button(win, text="OK", width=10, command=win.destroy).pack(pady=(0, 10))
+
+              def run_test(self, title, fn):
+                  """Runs a check in the background and shows its text when it is ready."""
+                  def work():
+                      try:
+                          out = fn()
+                      except Exception as e:
+                          out = "Error: " + (str(e) or type(e).__name__)
+                      self.uiq.put(lambda: self.show_text(title, out))
+                  threading.Thread(target=work, daemon=True).start()
+
+              # ---- background loops (they only fill self.st / self.rows; the window is drawn by _ui_tick)
+              @staticmethod
+              def _loop(fn, delay):
+                  def run():
+                      while True:
+                          try:
+                              fn()
+                          except Exception:
+                              pass
+                          time.sleep(delay)
+                  threading.Thread(target=run, daemon=True).start()
+
+              @staticmethod
+              def _res(f, timeout=6):
+                  try:
+                      return f.result(timeout=timeout)
+                  except Exception:
+                      return None
+
+              def fast_tick(self):
+                  """BTC price + main account PnL and positions. Repeats as fast as Delta answers."""
+                  cfg = self.cfg
+                  p = self.pool.submit(self.feeds.mark, SYMBOL)
+                  n = self.pool.submit(fetch_pnl, cfg, "")
+                  self.st["price"] = self._res(p)
+                  r = self._res(n)
+                  self.st["pnl"] = r if r is not None else (None, self.st["pnl"][1])
+
+              def sf_tick(self):
+                  """2nd Delta account PnL, on its own loop so it never slows the main PnL."""
+                  self.st["pnl2"] = fetch_pnl(self.cfg, "2")
+
+              def _adx_one(self, tf):
+                  h, l, c = self.feeds.candles(tf)
+                  return adx_calc(h, l, c)
+
+              def adx_tick(self):
+                  tfs = cfg_tfs(self.cfg)
+                  futs = [self.pool.submit(self._adx_one, tf) for tf in tfs]
+                  parts = []
+                  for tf, f in zip(tfs, futs):
+                      v = self._res(f)
+                      parts.append("%s --" % tf if v is None else "%s %.1f" % (tf, v))
+                  self.st["adx"] = "ADX " + " | ".join(parts)
+
+              def _index_job(self, spec):
+                  try:
+                      price = self.feeds.quote(spec)[0]
+                      prev = self.feeds.prev_map.get(spec.upper())
+                      if prev is None:
+                          prev = self.feeds.prev_for(spec)
+                      ref = self.refs.prev(spec, price)
+                      own = False
+                      if prev is None:
+                          prev = ref
+                          own = ref is not None
+                      self.rows[spec] = (price, prev, own)
+                  except Exception:
+                      self.rows[spec] = None
+                  finally:
+                      with self.busy_lock:
+                          self.busy.discard(spec)
+
+              def index_tick(self):
+                  """Every row is fetched on its own thread, so one slow source only delays its own row."""
+                  names = index_list(self.cfg)
+                  for _, spec in names:
+                      with self.busy_lock:
+                          if spec in self.busy:      # previous request for this row still running
+                              continue
+                          self.busy.add(spec)
+                      try:
+                          self.idx_pool.submit(self._index_job, spec)
+                      except Exception:
+                          with self.busy_lock:
+                              self.busy.discard(spec)
+                  # Nifty next to BTC: fetched here even if its row is hidden from the list
+                  row = self.rows.get("NIFTY")
+                  if row is not None:
+                      self.st["nifty"] = row[0]
+                  elif all(s != "NIFTY" for _, s in names):
+                      self.st["nifty"] = self._res(self.pool.submit(lambda: self.feeds.quote("NIFTY")[0]))
+                  else:
+                      self.st["nifty"] = None
+
+              # ---- drawing (main thread only)
+              def _set(self, w, text, fg=None):
+                  new = (text, fg)
+                  if self.shown.get(w) != new:
+                      self.shown[w] = new
+                      if fg is None:
+                          w.configure(text=text)
+                      else:
+                          w.configure(text=text, fg=fg)
+
+              def draw(self):
+                  st, cfg = self.st, self.cfg
+                  rate = cfg_rate(cfg)
+                  price = st["price"]
+                  self._set(self.l_price, "BTC --" if price is None else "BTC " + "{:,.1f}".format(price))
+                  nifty = st["nifty"]
+                  self._set(self.l_nifty, "| Nifty --" if nifty is None else "| Nifty " + "{:,.0f}".format(nifty))
+                  for lp, lpos, key in ((self.l_pnl, self.l_pos, "pnl"), (self.l_pnl2, self.l_pos2, "pnl2")):
+                      text, colour, pos = fmt_pnl(st[key][0], st[key][1], rate)
+                      self._set(lp, text, colour)
+                      self._set(lpos, pos)
+                  self._set(self.l_adx, st["adx"])
+                  names = index_list(cfg)
+                  for i in range(MAX_ROWS):
+                      on = i < len(names)
+                      wn, wp, wc = self.row_w[i]
+                      if on != self.row_on[i]:
+                          self.row_on[i] = on
+                          for w in (wn, wp, wc):
+                              if on:
+                                  w.grid()
+                              else:
+                                  w.grid_remove()
+                          self.right.rowconfigure(i, weight=1 if on else 0, uniform="row" if on else "")
+                      if not on:
+                          continue
+                      label, spec = names[i]
+                      self._set(wn, label)
+                      row = self.rows.get(spec)
+                      if row is None:
+                          self._set(wp, "--")
+                          self._set(wc, "", GREY)
+                          continue
+                      self._set(wp, fmt_price(spec, row[0]))
+                      text, colour = fmt_change(spec, row[0], row[1], row[2])
+                      self._set(wc, text, colour)
+
+              def _ui_tick(self):
+                  while True:
+                      try:
+                          job = self.uiq.get_nowait()
+                      except queue.Empty:
+                          break
+                      try:
+                          job()
+                      except Exception:
+                          pass
+                  try:
+                      self.draw()
+                  except Exception:
+                      pass
+                  self.root.after(200, self._ui_tick)
+
+
+          # ---------------------------------------------------------------- settings window
+          class Settings:
+              def __init__(self, app):
+                  self.app = app
+                  cfg = app.cfg
+                  self.vars = {}
+                  win = self.win = tk.Toplevel(app.root)
+                  self.v_title = tk.BooleanVar(win, value=not cfg["frameless"])
+                  win.title(APP + " settings")
+                  win.geometry("%dx%d" % (int(660 * app.scale), int(680 * app.scale)))
+                  win.attributes("-topmost", True)
+                  bar = tk.Frame(win, pady=8)
+                  bar.pack(side="bottom", fill="x")
+                  tk.Button(bar, text="Save and close", width=18, command=self.close).pack()
+                  sb = tk.Scrollbar(win, orient="vertical")
+                  sb.pack(side="right", fill="y")
+                  canvas = tk.Canvas(win, highlightthickness=0, yscrollcommand=sb.set)
+                  canvas.pack(side="left", fill="both", expand=True)
+                  sb.configure(command=canvas.yview)
+                  body = self.body = tk.Frame(canvas, padx=16, pady=10)
+                  item = canvas.create_window((0, 0), window=body, anchor="nw")
+                  body.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+                  canvas.bind("<Configure>", lambda e: canvas.itemconfigure(item, width=e.width))
+                  win.bind("<MouseWheel>", lambda e: canvas.yview_scroll(-1 if e.delta > 0 else 1, "units"))
+                  win.protocol("WM_DELETE_WINDOW", self.close)
+
+                  self.head("LOOK")
+                  self.slider("alpha", "Widget opacity in % (30 = see-through, 100 = solid; on Windows the text fades too)", 30, 100)
+                  self.slider("tsize", "Text size, left side: prices, PnL, Pos, ADX and the CHART / TT buttons", 8, 40)
+                  self.slider("isize", "Text size, index list on the right", 7, 40)
+                  self.check("topmost", "Always on top of other windows")
+                  tk.Checkbutton(body, text="Show a normal title bar (off = plain widget: drag it to move, drag the corner mark to resize)",
+                                 variable=self.v_title, command=self.live, anchor="w").pack(fill="x")
+
+                  self.head("MAIN DELTA ACCOUNT")
+                  self.field("relay", "Relay URL (fixed-IP server), e.g. https://1-2-3-4.sslip.io")
+                  self.field("rtoken", "Relay token")
+                  self.field("key", "Delta API key (read-only; optional backup if relay is down)")
+                  self.field("secret", "Delta API secret (optional backup)", secret=True)
+                  self.field("pnlsrc", "PnL source: blank = widget calculation (recommended). Type delta to use Delta's own field "
+                                       "(known to be wrong for options)")
+                  self.field("fee", "Fee per open position in rupees, subtracted from PnL. Try 12. Blank = none")
+                  self.field("rate", "USD-to-INR rate for PnL (blank = 85, Delta's fixed rate; type usd to show dollars)")
+                  self.field("tfs", "ADX timeframes, comma-separated (blank = 5m,15m,1h; options 1m,3m,5m,15m,30m,1h,4h)")
+                  self.button("Test PnL (shows raw Delta numbers)", lambda: self.test_pnl(""))
+                  self.button("Open Delta API page (to whitelist an IP)", lambda: webbrowser.open(DELTA_KEYS_PAGE))
+
+                  self.head("2ND DELTA ACCOUNT (the Secure Folder account on the phone)")
+                  self.field("key2", "2nd account Delta API key (read-only key is enough)")
+                  self.field("secret2", "2nd account Delta API secret", secret=True)
+                  self.field("relay2", "2nd account relay URL (optional; must be set up for the 2nd account's key)")
+                  self.field("rtoken2", "2nd account relay token (optional)")
+                  self.field("pnlsrc2", "2nd account PnL source: blank = widget calculation (recommended); type delta for Delta's own field")
+                  self.field("fee2", "2nd account fee per open position in rupees. Blank = none")
+                  self.button("Test PnL of 2nd account", lambda: self.test_pnl("2"))
+
+                  self.head("BUTTONS")
+                  self.field("chartlink", "CHART button link: paste the link of the chart you want (e.g. a TradingView or Delta chart link)")
+                  self.field("tt1link", "TT 1 button: a link, or the full path of a program (blank = Tradetron deployed strategies page)")
+                  self.field("tt2link", "TT 2 button: a link, or the full path of a program (blank = Tradetron deployed strategies page)")
+
+                  self.head("INDEX LIST")
+                  self.field("hide", "Hide rows, comma-separated (e.g. SILVER,CRUDE). Names: NIFTY GIFT MIDCAP SMALL VIX BTC ETH XAU GOLD "
+                                     "SILVER DOW NASDAQ CRUDE USDINR. A * after a change means it is measured against the widget's own "
+                                     "saved close of the previous day")
+                  self.note("Extra prices (%d slots): a name and a symbol. Symbols: SOLUSD (Delta), idx:nifty-bank idx:sensex "
+                            "(angelone.in/indices/<name>), yahoo:^NSEBANK, bullions:mcx bullions:24k bullions:22k bullions:silver"
+                            % CUSTOM_SLOTS)
+                  for i in range(1, CUSTOM_SLOTS + 1):
+                      row = tk.Frame(body)
+                      row.pack(fill="x", pady=1)
+                      tk.Label(row, text="Index %d  name" % i, width=13, anchor="w").pack(side="left")
+                      self.entry(row, "c%dl" % i, 16).pack(side="left")
+                      tk.Label(row, text="  symbol").pack(side="left")
+                      self.entry(row, "c%ds" % i, 30).pack(side="left", fill="x", expand=True)
+                  self.button("Test gold (bullions.co.in)", lambda: app.run_test("Gold check", app.feeds.bullions_debug))
+                  self.button("Test prices (shows each source)", lambda: app.run_test("Index check", app.feeds.index_debug))
+                  self.note("Settings are kept in " + CFG_DIR)
+
+              def alive(self):
+                  try:
+                      return bool(self.win.winfo_exists())
+                  except Exception:
+                      return False
+
+              # ---- building blocks
+              def head(self, text):
+                  tk.Label(self.body, text=text, font=(FONT, 11, "bold"), anchor="w").pack(fill="x", pady=(16, 2))
+
+              def note(self, text):
+                  tk.Label(self.body, text=text, anchor="w", justify="left", wraplength=int(600 * self.app.scale)).pack(fill="x", pady=(8, 0))
+
+              def entry(self, parent, key, width, secret=False):
+                  v = self.vars[key] = tk.StringVar(self.win, value=self.app.cfg[key])
+                  return tk.Entry(parent, textvariable=v, width=width, show="*" if secret else "")
+
+              def field(self, key, hint, secret=False):
+                  self.note(hint)
+                  self.entry(self.body, key, 70, secret).pack(fill="x")
+
+              def slider(self, key, title, lo, hi):
+                  self.note(title)
+                  v = self.vars[key] = tk.IntVar(self.win, value=self.app.cfg[key])
+                  tk.Scale(self.body, from_=lo, to=hi, orient="horizontal", variable=v,
+                           command=lambda _v: self.live()).pack(fill="x")
+
+              def check(self, key, text):
+                  v = self.vars[key] = tk.BooleanVar(self.win, value=self.app.cfg[key])
+                  tk.Checkbutton(self.body, text=text, variable=v, command=self.live, anchor="w").pack(fill="x", pady=(8, 0))
+
+              def button(self, text, command):
+                  tk.Button(self.body, text=text, command=command, anchor="w", padx=8).pack(anchor="w", pady=(8, 0))
+
+              # ---- reading the form
+              def collect(self):
+                  new = dict(self.app.cfg)
+                  for k, v in self.vars.items():
+                      try:
+                          new[k] = v.get()
+                      except Exception:
+                          pass
+                  new["frameless"] = not bool(self.v_title.get())
+                  new = clean_cfg(new)
+                  return new
+
+              def live(self):
+                  """Sliders and tick boxes act at once, so the result is visible while choosing."""
+                  self.app.cfg = self.collect()
+                  self.app.apply_look()
+
+              def test_pnl(self, sfx):
+                  c = self.collect()
+                  rate = cfg_rate(c)
+                  self.app.run_test("PnL check" if not sfx else "2nd account PnL check",
+                                    lambda: pnl_debug(c["key" + sfx], c["secret" + sfx], c["relay" + sfx], c["rtoken" + sfx],
+                                                      rate if rate > 0 else 85.0, c["pnlsrc" + sfx].lower(), c["fee" + sfx].lower()))
+
+              def close(self):
+                  self.app._remember_window()
+                  new = self.collect()
+                  for k in ("x", "y", "w", "h"):
+                      new[k] = self.app.cfg[k]
+                  self.app.cfg = new
+                  save_cfg(new)
+                  self.app.apply_look()
+                  self.win.destroy()
+
+
+          def main():
+              try:      # sharp text on high-resolution laptop screens
+                  import ctypes
+                  ctypes.windll.shcore.SetProcessDpiAwareness(1)   # type: ignore[attr-defined]
+              except Exception:
+                  pass
+              try:
+                  App().root.mainloop()
+              except Exception:
+                  import traceback
+                  try:
+                      os.makedirs(CFG_DIR, exist_ok=True)
+                      with open(LOG_FILE, "a", encoding="utf-8") as f:
+                          f.write(time.strftime("%Y-%m-%d %H:%M:%S\n") + traceback.format_exc() + "\n")
+                  except Exception:
+                      pass
+                  raise
+
+
+          if __name__ == "__main__":
+              main()
+          END_OF_FILE_X
+      - name: Check source
+        run: |
+          python -m py_compile widget_windows.py
+          python -c "import widget_windows; print('source ok')"
+      - name: Build exe
+        run: |
+          python -m pip install "pyinstaller>=6,<7"
+          # one plain .exe: no console window, no UPX packing (packed files are what antivirus tools flag most)
+          pyinstaller --onefile --noconsole --noupx --clean --name widget-windows widget_windows.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: widget-windows-exe
+          path: dist/widget-windows.exe
