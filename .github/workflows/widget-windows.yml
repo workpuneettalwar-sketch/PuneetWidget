@@ -19,8 +19,8 @@ jobs:
           cat > widget_windows.py <<'END_OF_FILE_X'
           """Widget Windows - the laptop version of Widget Tablet (personal use). Python standard library only.
 
-          Left side : BTC | Nifty, PnL + positions of both Delta accounts, CHART / TT 1 / TT 2 buttons, ADX.
-          Right side: the index list, always open.
+          Top   : BTC | Nifty, PnL + positions of both Delta accounts, ADX.
+          Below : a separator line, then the index list, always open.
           Drag the widget to move it, drag the corner mark to resize it, right-click (or the gear) for settings.
           """
           import gzip
@@ -60,13 +60,14 @@ jobs:
           REF_FILE = os.path.join(CFG_DIR, "prev-close.json")
           LOG_FILE = os.path.join(CFG_DIR, "error.log")
 
-          STR_KEYS = (["relay", "rtoken", "key", "secret", "chartlink", "tt1link", "tt2link", "hide", "pnlsrc", "fee",
+          STR_KEYS = (["relay", "rtoken", "key", "secret", "hide", "pnlsrc", "fee",
                        "rate", "tfs", "key2", "secret2", "relay2", "rtoken2", "pnlsrc2", "fee2"]
                       + ["c%dl" % i for i in range(1, CUSTOM_SLOTS + 1)]
                       + ["c%ds" % i for i in range(1, CUSTOM_SLOTS + 1)])
-          INT_KEYS = {"alpha": (30, 100, 92), "tsize": (8, 40, 14), "isize": (7, 40, 11),
+          INT_KEYS = {"alpha": (30, 100, 92), "tsize": (6, 60, 14), "isize": (6, 60, 11),
                       "x": (-20000, 20000, 80), "y": (-20000, 20000, 80), "w": (0, 10000, 0), "h": (0, 10000, 0)}
-          BOOL_KEYS = {"topmost": False, "frameless": True}
+          BOOL_KEYS = {"topmost": False, "frameless": True, "transparent": False}
+          LAYOUT = 2                # 2 = one column (top text, separator, index list)
 
 
           # ---------------------------------------------------------------- settings file
@@ -74,6 +75,7 @@ jobs:
               cfg = {k: "" for k in STR_KEYS}
               cfg.update({k: v[2] for k, v in INT_KEYS.items()})
               cfg.update(BOOL_KEYS)
+              cfg["layout"] = LAYOUT
               return cfg
 
 
@@ -93,6 +95,9 @@ jobs:
               for k in BOOL_KEYS:
                   if isinstance(saved.get(k), bool):
                       cfg[k] = saved[k]
+              if saved.get("layout") != LAYOUT:      # a size saved by the old side-by-side layout would not fit
+                  cfg["w"] = cfg["h"] = 0
+              cfg["layout"] = LAYOUT
               return cfg
 
 
@@ -816,19 +821,8 @@ jobs:
               return "%s (%+.2f%%)%s" % (pts, pct, "*" if own else ""), (GREEN if diff >= 0 else RED)
 
 
-          def open_target(t):
-              """Opens a web link, or a program / file / folder when a path on this laptop is given."""
-              t = t.strip().strip('"')
-              if "://" in t:
-                  webbrowser.open(t)
-              elif os.path.exists(t):
-                  os.startfile(t)   # type: ignore[attr-defined]
-              else:
-                  webbrowser.open("https://" + t)
-
-
           # ---------------------------------------------------------------- the window
-          BG, SEP, BTN, BTN_EDGE, ADX_FG = "#101418", "#40444A", "#2E9E4F", "#7BD99A", "#E6EBF0"
+          BG, SEP, ADX_FG = "#101418", "#5A6068", "#E6EBF0"
           FONT = "Segoe UI"
 
 
@@ -861,24 +855,22 @@ jobs:
                   self.f_big = tkfont.Font(family=FONT, size=17, weight="bold")
                   self.f_pnl = tkfont.Font(family=FONT, size=15, weight="bold")
                   self.f_txt = tkfont.Font(family=FONT, size=14, weight="bold")
-                  self.f_btn = tkfont.Font(family=FONT, size=10, weight="bold")
                   self.f_idx = tkfont.Font(family=FONT, size=11)
                   self.f_idxb = tkfont.Font(family=FONT, size=11, weight="bold")
 
                   pad = int(10 * self.scale)
                   outer = tk.Frame(root, bg=BG, padx=pad, pady=pad)
                   outer.pack(fill="both", expand=True)
-                  outer.columnconfigure(0, weight=11, uniform="side")
-                  outer.columnconfigure(2, weight=10, uniform="side")
-                  outer.rowconfigure(0, weight=1)
-                  left = tk.Frame(outer, bg=BG)
-                  left.grid(row=0, column=0, sticky="nsew")
-                  tk.Frame(outer, bg=SEP, width=1).grid(row=0, column=1, sticky="ns", padx=pad)
+                  outer.columnconfigure(0, weight=1)
+                  outer.rowconfigure(2, weight=1)
+                  top = tk.Frame(outer, bg=BG)
+                  top.grid(row=0, column=0, sticky="ew")
+                  tk.Frame(outer, bg=SEP, height=max(1, int(self.scale))).grid(row=1, column=0, sticky="ew", pady=int(6 * self.scale))
                   right = self.right = tk.Frame(outer, bg=BG)
-                  right.grid(row=0, column=2, sticky="nsew")
+                  right.grid(row=2, column=0, sticky="nsew")
 
-                  # LEFT: prices, PnL of both accounts, CHART / TT 1 / TT 2, ADX
-                  r1 = tk.Frame(left, bg=BG)
+                  # TOP: prices, PnL + positions of both accounts, ADX
+                  r1 = tk.Frame(top, bg=BG)
                   r1.pack(fill="x")
                   self.l_price = self._label(r1, "BTC --", self.f_big, WHITE)
                   self.l_price.pack(side="left")
@@ -888,31 +880,24 @@ jobs:
                   self.l_gear.bind("<ButtonRelease-1>", lambda e: self._click(self.open_settings))
                   self.l_nifty = self._label(r1, "| Nifty --", self.f_big, WHITE)
                   self.l_nifty.pack(side="left", padx=(8, 0))
-                  r2 = tk.Frame(left, bg=BG)
+                  r2 = tk.Frame(top, bg=BG)
                   r2.pack(fill="x")
                   self.l_pnl = self._label(r2, "PnL --", self.f_pnl, GREY)
                   self.l_pnl.pack(side="left")
                   self.l_pos = self._label(r2, "Pos --", self.f_txt, WHITE)
                   self.l_pos.pack(side="left", padx=(12, 0))
-                  r3 = tk.Frame(left, bg=BG)
+                  r3 = tk.Frame(top, bg=BG)
                   r3.pack(fill="x")
                   self.l_pnl2 = self._label(r3, "PnL --", self.f_pnl, GREY)
                   self.l_pnl2.pack(side="left")
                   self.l_pos2 = self._label(r3, "Pos --", self.f_txt, WHITE)
                   self.l_pos2.pack(side="left", padx=(12, 0))
-                  r4 = tk.Frame(left, bg=BG)
-                  r4.pack(fill="x", pady=(6, 2))
-                  for col, (text, which) in enumerate([("CHART", "chart"), ("TT 1", "tt1"), ("TT 2", "tt2")]):
-                      r4.columnconfigure(col, weight=1, uniform="btn")
-                      b = tk.Label(r4, text=text, font=self.f_btn, bg=BTN, fg=WHITE, pady=3, cursor="hand2",
-                                   highlightthickness=1, highlightbackground=BTN_EDGE)
-                      b.grid(row=0, column=col, sticky="ew", padx=(0, 8 if col < 2 else 0))
-                      b.bind("<ButtonRelease-1>", lambda e, w=which: self._click(lambda: self.open_link(w)))
-                  self.l_adx = self._label(left, "ADX --", self.f_txt, ADX_FG)
+                  self.l_adx = self._label(top, "ADX --", self.f_txt, ADX_FG)
                   self.l_adx.configure(justify="left")
                   self.l_adx.pack(fill="x", pady=(3, 0))
-                  left.bind("<Configure>", lambda e: self.l_adx.configure(wraplength=max(60, e.width)))
+                  top.bind("<Configure>", lambda e: self.l_adx.configure(wraplength=max(60, e.width)))
 
+                  # BELOW the separator: the index list, always open
                   # RIGHT: the index list, always open
                   right.columnconfigure(0, weight=11, uniform="col")
                   right.columnconfigure(1, weight=10, uniform="col")
@@ -931,17 +916,19 @@ jobs:
                       right.rowconfigure(i, weight=1, uniform="row")
 
                   # corner mark for resizing (used when there is no title bar)
-                  self.grip = tk.Label(root, text="\u25E2", bg=BG, fg="#5A6068", cursor="size_nw_se", font=(FONT, 9))
+                  self.grip = tk.Label(root, text="\u25E2", bg=BG, fg="#8A9098", cursor="size_nw_se", font=(FONT, 9))
                   self.grip.bind("<ButtonPress-1>", self._grip_press)
                   self.grip.bind("<B1-Motion>", self._grip_drag)
                   self.grip.bind("<ButtonRelease-1>", self._grip_release)
 
                   self.v_top = tk.BooleanVar(root, value=self.cfg["topmost"])
                   self.v_frame = tk.BooleanVar(root, value=not self.cfg["frameless"])
+                  self.v_clear = tk.BooleanVar(root, value=self.cfg["transparent"])
                   self.menu = tk.Menu(root, tearoff=0)
                   self.menu.add_command(label="Settings", command=self.open_settings)
                   self.menu.add_checkbutton(label="Always on top", variable=self.v_top, command=self._menu_toggle)
                   self.menu.add_checkbutton(label="Show title bar", variable=self.v_frame, command=self._menu_toggle)
+                  self.menu.add_checkbutton(label="Fully transparent background", variable=self.v_clear, command=self._menu_toggle)
                   self.menu.add_separator()
                   self.menu.add_command(label="Exit", command=self.quit)
                   root.bind("<Button-3>", self._popup)
@@ -965,8 +952,8 @@ jobs:
               # ---- window position, size and look
               def _place_window(self):
                   root, cfg = self.root, self.cfg
-                  w = cfg["w"] or int(860 * self.scale)
-                  h = cfg["h"] or int(360 * self.scale)
+                  w = cfg["w"] or int(430 * self.scale)
+                  h = cfg["h"] or int(560 * self.scale)
                   x, y = cfg["x"], cfg["y"]
                   try:      # keep it reachable if a second screen was unplugged
                       vx, vy = root.winfo_vrootx(), root.winfo_vrooty()
@@ -994,6 +981,10 @@ jobs:
                       root.attributes("-topmost", bool(cfg["topmost"]))
                   except Exception:
                       pass
+                  try:      # Windows shows nothing where the window has exactly this colour: only the text stays
+                      root.attributes("-transparentcolor", BG if cfg["transparent"] else "")
+                  except Exception:
+                      pass
                   frameless = bool(cfg["frameless"])
                   if frameless != self._frameless:
                       first = self._frameless is None
@@ -1014,15 +1005,16 @@ jobs:
                   self.f_big.configure(size=ts + 3)
                   self.f_pnl.configure(size=ts + 1)
                   self.f_txt.configure(size=ts)
-                  self.f_btn.configure(size=max(8, int(round(ts * 0.7))))
                   self.f_idx.configure(size=isz)
                   self.f_idxb.configure(size=isz)
                   self.v_top.set(bool(cfg["topmost"]))
                   self.v_frame.set(not frameless)
+                  self.v_clear.set(bool(cfg["transparent"]))
 
               def _menu_toggle(self):
                   self.cfg["topmost"] = bool(self.v_top.get())
                   self.cfg["frameless"] = not bool(self.v_frame.get())
+                  self.cfg["transparent"] = bool(self.v_clear.get())
                   self.apply_look()
                   save_cfg(self.cfg)
 
@@ -1085,20 +1077,6 @@ jobs:
                       self.settings.win.focus_force()
                       return
                   self.settings = Settings(self)
-
-              def open_link(self, which):
-                  """CHART opens the saved chart link. TT 1 / TT 2 open their link or program (blank = Tradetron page)."""
-                  t = self.cfg["chartlink" if which == "chart" else which + "link"]
-                  if not t and which != "chart":
-                      t = TT_DEFAULT
-                  if not t:
-                      self.open_settings()
-                      self.show_text("CHART button", "Add the chart link in settings (the field named CHART button link).")
-                      return
-                  try:
-                      open_target(t)
-                  except Exception as e:
-                      self.show_text("Could not open", str(e) or type(e).__name__)
 
               def show_text(self, title, text):
                   win = tk.Toplevel(self.root)
@@ -1296,9 +1274,10 @@ jobs:
                   win.protocol("WM_DELETE_WINDOW", self.close)
 
                   self.head("LOOK")
-                  self.slider("alpha", "Widget opacity in % (30 = see-through, 100 = solid; on Windows the text fades too)", 30, 100)
-                  self.slider("tsize", "Text size, left side: prices, PnL, Pos, ADX and the CHART / TT buttons", 8, 40)
-                  self.slider("isize", "Text size, index list on the right", 7, 40)
+                  self.check("transparent", "Fully transparent background: only the text shows, the desktop is visible behind it")
+                  self.slider("alpha", "Opacity of the whole widget in % (30 = faint, 100 = solid; this fades the text too)", 30, 100)
+                  self.slider("tsize", "Text size, top part: prices, PnL, Pos and ADX", 6, 60)
+                  self.slider("isize", "Text size, index list", 6, 60)
                   self.check("topmost", "Always on top of other windows")
                   tk.Checkbutton(body, text="Show a normal title bar (off = plain widget: drag it to move, drag the corner mark to resize)",
                                  variable=self.v_title, command=self.live, anchor="w").pack(fill="x")
@@ -1324,11 +1303,6 @@ jobs:
                   self.field("pnlsrc2", "2nd account PnL source: blank = widget calculation (recommended); type delta for Delta's own field")
                   self.field("fee2", "2nd account fee per open position in rupees. Blank = none")
                   self.button("Test PnL of 2nd account", lambda: self.test_pnl("2"))
-
-                  self.head("BUTTONS")
-                  self.field("chartlink", "CHART button link: paste the link of the chart you want (e.g. a TradingView or Delta chart link)")
-                  self.field("tt1link", "TT 1 button: a link, or the full path of a program (blank = Tradetron deployed strategies page)")
-                  self.field("tt2link", "TT 2 button: a link, or the full path of a program (blank = Tradetron deployed strategies page)")
 
                   self.head("INDEX LIST")
                   self.field("hide", "Hide rows, comma-separated (e.g. SILVER,CRUDE). Names: NIFTY GIFT MIDCAP SMALL VIX BTC ETH XAU GOLD "
