@@ -1,8 +1,6 @@
-name: Build Merged App
+name: Build Stock Widget
 on:
   push:
-    paths:
-      - '.github/workflows/merged-app.yml'
   workflow_dispatch:
 jobs:
   build:
@@ -68,6 +66,8 @@ jobs:
                   </activity>
                   <activity android:name=".IndexActivity" android:exported="false"
                       android:theme="@android:style/Theme.DeviceDefault.Dialog" android:label="Indices"/>
+                  <activity android:name=".ChartLaunch" android:exported="false" android:excludeFromRecents="true"
+                      android:noHistory="true" android:taskAffinity="" android:theme="@android:style/Theme.NoDisplay"/>
                   <activity android:name=".SfLaunch" android:exported="false" android:excludeFromRecents="true"
                       android:noHistory="true" android:taskAffinity="" android:theme="@android:style/Theme.NoDisplay"/>
                   <receiver android:name=".WidgetProvider" android:exported="true">
@@ -320,6 +320,7 @@ jobs:
                       "GOLD" -> listOf("bullions" to { bullion("24k") })
                       "SILVER" -> listOf("bullions" to { bullion("silver") })
                       "NIFTY" -> listOf("NSE" to { nseIdx("NIFTY 50") }, "Yahoo" to { yahoo("^NSEI") }, "Angel" to { indexPrice("nifty-50") })
+                      "BANKNIFTY" -> listOf("NSE" to { nseIdx("NIFTY BANK") }, "Yahoo" to { yahoo("^NSEBANK") }, "Angel" to { indexPrice("nifty-bank") })
                       "MIDCAP" -> listOf("NSE" to { nseIdx("NIFTY MIDCAP 100") }, "Yahoo" to { yahoo("NIFTY_MIDCAP_100.NS") }, "Angel" to { indexPrice("nifty-midcap-100") })
                       "SMALL" -> listOf("NSE" to { nseIdx("NIFTY SMALLCAP 100") }, "Yahoo" to { yahoo("^CNXSC") }, "Angel" to { indexPrice("nifty-smallcap-100") })
                       "VIX" -> listOf("NSE" to { nseIdx("INDIA VIX") }, "Yahoo" to { yahoo("^INDIAVIX") }, "Angel" to { indexPrice("india-vix") })
@@ -371,7 +372,7 @@ jobs:
               /** For the "Test indices" button: every source of every built-in, tried one by one. */
               fun indexDebug(): String {
                   val sb = StringBuilder()
-                  for (spec in listOf("NIFTY", "GOLD", "ETH", "SILVER", "MIDCAP", "SMALL", "GIFT", "VIX", "XAU", "NASDAQ", "DOW", "CRUDE", "USDINR")) {
+                  for (spec in listOf("NIFTY", "BANKNIFTY", "GOLD", "ETH", "SILVER", "MIDCAP", "SMALL", "GIFT", "VIX", "XAU", "NASDAQ", "DOW", "CRUDE", "USDINR")) {
                       sb.append(spec).append(": ")
                       val parts = sources(spec).map { (n, f) ->
                           try { tlPrev.set(null); val v = f(); "$n=" + "%.1f".format(v) + (tlPrev.get()?.let { " (prev %.1f)".format(it) } ?: " (no prev)") } catch (e: Exception) { "$n=ERR(" + (e.message ?: e.javaClass.simpleName).take(40) + ")" }
@@ -574,7 +575,7 @@ jobs:
           /** Pop-up opened from the widget's INDICES button: every index with change vs the previous session. */
           class IndexActivity : Activity() {
               private val names = ArrayList<Pair<String, String>>().apply { addAll(listOf(
-                  "Nifty 50" to "NIFTY", "Gift Nifty" to "GIFT", "Midcap 100" to "MIDCAP", "Smallcap 100" to "SMALL", "India VIX" to "VIX",
+                  "Nifty 50" to "NIFTY", "Bank Nifty" to "BANKNIFTY", "Gift Nifty" to "GIFT", "Midcap 100" to "MIDCAP", "Smallcap 100" to "SMALL", "India VIX" to "VIX",
                   "BTC" to "BTC", "ETH" to "ETH", "XAUUSD" to "XAU", "Gold" to "GOLD", "Silver" to "SILVER",
                   "Dow Jones" to "DOW", "Nasdaq" to "NASDAQ", "Crude Oil" to "CRUDE")) }
               private val srcs = java.util.concurrent.ConcurrentHashMap<Int, String>()
@@ -800,6 +801,27 @@ jobs:
                   finish()
               }
           }
+
+          /** Invisible screen behind the widget's CHART button: opens the link saved in settings. */
+          class ChartLaunch : Activity() {
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  val key = intent.getStringExtra("k") ?: "chartlink"
+                  var link = Prefs.str(this, key).trim()
+                  if (link.isEmpty()) {
+                      Toast.makeText(applicationContext, "Add the " + (if (key == "stratlink") "STRATEGIES" else "CHART") + " button link in widget settings", Toast.LENGTH_LONG).show()
+                      startActivity(Intent(this, SettingsActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                  } else {
+                      if (!link.contains("://")) link = "https://$link"
+                      try {
+                          startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse(link)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                      } catch (e: Exception) {
+                          Toast.makeText(applicationContext, "Could not open link: " + (e.message ?: e.javaClass.simpleName), Toast.LENGTH_LONG).show()
+                      }
+                  }
+                  finish()
+              }
+          }
           END_OF_FILE_X
 
           mkdir -p 'app/src/main/java/com/btcwidget'
@@ -851,6 +873,8 @@ jobs:
                   field("rtoken", "Relay token")
                   field("key", "Delta API key (read-only; optional backup if relay is down)")
                   field("secret", "Delta API secret (optional backup)")
+                  field("stratlink", "STRATEGIES button link: paste the link to open (e.g. your Tradetron deployed strategies page)")
+                  field("chartlink", "CHART button link: paste the link of the chart you want (e.g. a TradingView or Delta chart link)")
                   label("Extra prices for the INDICES pop-up (3 slots): a name and a symbol. Symbols: SOLUSD (Delta), idx:nifty-bank idx:sensex (angelone.in/indices/<name>), yahoo:^NSEBANK, bullions:mcx bullions:24k bullions:22k bullions:silver")
                   for (i in 1..3) {
                       field("c${i}l", "Index $i name (e.g. BANKNIFTY)")
@@ -1097,6 +1121,10 @@ jobs:
                   rv.setViewVisibility(R.id.row3, if (sfs.any { it.isNotEmpty() }) View.VISIBLE else View.GONE)
                   rv.setOnClickPendingIntent(R.id.idxbtn, PendingIntent.getActivity(this, 4,
                       Intent(this, IndexActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK), PendingIntent.FLAG_IMMUTABLE))
+                  rv.setOnClickPendingIntent(R.id.chartbtn, PendingIntent.getActivity(this, 5,
+                      Intent(this, ChartLaunch::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK), PendingIntent.FLAG_IMMUTABLE))
+                  rv.setOnClickPendingIntent(R.id.stratbtn, PendingIntent.getActivity(this, 6,
+                      Intent(this, ChartLaunch::class.java).putExtra("k", "stratlink").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK), PendingIntent.FLAG_IMMUTABLE))
                   rv.setOnClickPendingIntent(R.id.gear, PendingIntent.getActivity(this, 3,
                       Intent(this, SettingsActivity::class.java), PendingIntent.FLAG_IMMUTABLE))
                   AppWidgetManager.getInstance(this).updateAppWidget(ids(), rv)
@@ -1193,7 +1221,7 @@ jobs:
                   val vals = x.map { it.res() }
                   specs.zip(vals).forEach { (sp, v) -> if (v != null) Prefs.refPrev(this, sp, v) }
                   val rv = RemoteViews(packageName, R.layout.widget)
-                  rv.setTextViewText(R.id.nifty, vals[0]?.let { String.format(Locale.US, "| Nifty %,.0f", it) } ?: "| Nifty --")
+                  rv.setTextViewText(R.id.nifty, vals[0]?.let { String.format(Locale.US, "Nifty %,.0f", it) } ?: "Nifty --")
                   update(rv)
               }
 
@@ -1275,10 +1303,32 @@ jobs:
                           android:text="BTC --" android:textColor="#FFFFFF"
                           android:textSize="20sp" android:textStyle="bold" android:singleLine="true"/>
                       <TextView android:id="@+id/nifty" android:layout_width="0dp" android:layout_height="wrap_content"
-                          android:layout_weight="1" android:layout_marginStart="8dp" android:text="| Nifty --"
+                          android:layout_weight="1" android:layout_marginStart="14dp" android:text="Nifty --"
                           android:textColor="#FFFFFF" android:textSize="20sp" android:textStyle="bold" android:singleLine="true"/>
                       <ImageView android:id="@+id/gear" android:layout_width="24dp" android:layout_height="24dp"
                           android:src="@android:drawable/ic_menu_preferences"/>
+                  </LinearLayout>
+                  <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+                      android:layout_marginTop="2dp" android:layout_marginBottom="2dp"
+                      android:orientation="horizontal" android:gravity="center_vertical">
+                      <TextView android:id="@+id/stratbtn" android:layout_width="wrap_content" android:layout_height="wrap_content"
+                          android:layout_marginEnd="10dp" android:gravity="center"
+                          android:paddingLeft="12dp" android:paddingRight="12dp"
+                          android:paddingTop="3dp" android:paddingBottom="3dp" android:background="@drawable/idx_btn"
+                          android:text="STRATEGIES" android:textColor="#FFFFFF" android:textSize="12sp" android:textStyle="bold"
+                          android:singleLine="true"/>
+                      <TextView android:id="@+id/chartbtn" android:layout_width="wrap_content" android:layout_height="wrap_content"
+                          android:layout_marginEnd="10dp" android:gravity="center"
+                          android:paddingLeft="12dp" android:paddingRight="12dp"
+                          android:paddingTop="3dp" android:paddingBottom="3dp" android:background="@drawable/idx_btn"
+                          android:text="CHART" android:textColor="#FFFFFF" android:textSize="12sp" android:textStyle="bold"
+                          android:singleLine="true"/>
+                      <TextView android:id="@+id/idxbtn" android:layout_width="wrap_content" android:layout_height="wrap_content"
+                          android:gravity="center"
+                          android:paddingLeft="12dp" android:paddingRight="12dp"
+                          android:paddingTop="3dp" android:paddingBottom="3dp" android:background="@drawable/idx_btn"
+                          android:text="INDICES" android:textColor="#FFFFFF" android:textSize="12sp" android:textStyle="bold"
+                          android:singleLine="true"/>
                   </LinearLayout>
                   <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
                       android:orientation="horizontal" android:gravity="center_vertical">
@@ -1289,11 +1339,6 @@ jobs:
                       <TextView android:id="@+id/pos" android:layout_width="wrap_content" android:layout_height="wrap_content"
                           android:layout_marginStart="12dp" android:text="Pos --" android:textColor="#FFFFFF"
                           android:textSize="15sp" android:textStyle="bold" android:singleLine="true"/>
-                      <TextView android:id="@+id/idxbtn" android:layout_width="wrap_content" android:layout_height="wrap_content"
-                          android:layout_marginStart="14dp" android:paddingLeft="12dp" android:paddingRight="12dp"
-                          android:paddingTop="3dp" android:paddingBottom="3dp" android:background="@drawable/idx_btn"
-                          android:text="INDICES" android:textColor="#FFFFFF" android:textSize="12sp" android:textStyle="bold"
-                          android:singleLine="true"/>
                   </LinearLayout>
                   <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
                       android:orientation="horizontal" android:gravity="center_vertical">
@@ -1354,7 +1399,7 @@ jobs:
 
           mkdir -p 'app/src/main/res/values'
           cat > 'app/src/main/res/values/strings.xml' <<'END_OF_FILE_X'
-          <resources><string name="app_name">Merged App</string></resources>
+          <resources><string name="app_name">Stock Widget</string></resources>
           END_OF_FILE_X
 
           mkdir -p 'app/src/main/res/xml'
@@ -1446,8 +1491,12 @@ jobs:
           +SK3wd+2llkbEWG0C9Tuu1lC3OQUbxZTifhwBBSd1YKBk5q92OTQoRwjRky18VEvMQICJxA=
           END_B64
       - name: Build
-        run: cd merged-app && gradle assembleDebug -PverCode=${{ github.run_number }} --no-daemon
+        run: |
+          # version number always higher than any earlier build (minutes since 1 Jan 2026), so it always installs as an update
+          VC=$(( ($(date +%s) - 1767225600) / 60 ))
+          echo "versionCode = $VC"
+          cd merged-app && gradle assembleDebug -PverCode=$VC --no-daemon
       - uses: actions/upload-artifact@v4
         with:
-          name: merged-app-apk
+          name: stock-widget-apk
           path: merged-app/app/build/outputs/apk/debug/app-debug.apk
