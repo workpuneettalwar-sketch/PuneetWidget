@@ -38,7 +38,10 @@ jobs:
               compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
               kotlinOptions { jvmTarget = "17" }
           }
-          dependencies { implementation("androidx.core:core-ktx:1.13.1") }
+          dependencies {
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.webkit:webkit:1.11.0")
+          }
           END_OF_FILE_X
 
           mkdir -p 'app/src/main'
@@ -50,7 +53,8 @@ jobs:
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE"/>
               <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
               <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
-              <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"/>
+              <uses-permission android:name="android.permission.VIBRATE"/>
+              <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"/>
               <queries>
                   <intent>
                       <action android:name="android.intent.action.MAIN"/>
@@ -68,8 +72,16 @@ jobs:
                       android:theme="@android:style/Theme.DeviceDefault.Dialog" android:label="Indices"/>
                   <activity android:name=".ChartLaunch" android:exported="false" android:excludeFromRecents="true"
                       android:noHistory="true" android:taskAffinity="" android:theme="@android:style/Theme.NoDisplay"/>
-                  <activity android:name=".SfLaunch" android:exported="false" android:excludeFromRecents="true"
+                  <activity android:name=".tt.TtSettingsActivity" android:exported="false" android:label="Tradetron status"/>
+                  <activity android:name=".tt.WebActivity" android:exported="false" android:label="Tradetron"
+                      android:configChanges="orientation|screenSize|keyboardHidden"/>
+                  <activity android:name=".tt.OpenActivity" android:exported="false" android:excludeFromRecents="true"
                       android:noHistory="true" android:taskAffinity="" android:theme="@android:style/Theme.NoDisplay"/>
+                  <service android:name=".tt.TtService" android:exported="false" android:foregroundServiceType="specialUse">
+                      <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE" android:value="live Tradetron status watch"/>
+                  </service>
+                  <service android:name=".tt.TtListService" android:exported="false"
+                      android:permission="android.permission.BIND_REMOTEVIEWS"/>
                   <receiver android:name=".WidgetProvider" android:exported="true">
                       <intent-filter><action android:name="android.appwidget.action.APPWIDGET_UPDATE"/></intent-filter>
                       <meta-data android:name="android.appwidget.provider" android:resource="@xml/widget_info"/>
@@ -587,7 +599,6 @@ jobs:
 
               override fun onCreate(b: Bundle?) {
                   super.onCreate(b)
-                  for ((l, sp) in Prefs.extras(this)) if (sp !in Prefs.BUILTIN) names.add(l to sp)
                   names.add("USD/INR" to "USDINR")
                   val d = resources.displayMetrics.density
                   val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding((16 * d).toInt(), (12 * d).toInt(), (16 * d).toInt(), (12 * d).toInt()) }
@@ -661,8 +672,16 @@ jobs:
               const val ACTION_CYCLE = "com.btcwidget.CYCLE"
               val TFS = listOf("1m", "3m", "5m", "15m", "30m", "1h", "4h")
               val SLOT_KEYS = listOf("tvpkg", "dpkg", "tpkg") + (4..12).map { "app$it" }
-              /** The 3 Secure Folder buttons: "package/activity|profile serial". */
-              val SF_KEYS = listOf("sf1", "sf2", "sf3")
+
+              /** Once: 12 button slots become 10 (5 per row). Apps already chosen keep their order, gaps are closed. */
+              fun migrateSlots(c: Context) {
+                  val p = sp(c)
+                  if (p.getBoolean("slots10", false)) return
+                  val used = SLOT_KEYS.map { p.getString(it, "") ?: "" }.filter { it.isNotEmpty() }.take(10)
+                  val e = p.edit()
+                  SLOT_KEYS.forEachIndexed { i, k -> e.putString(k, used.getOrElse(i) { "" }) }
+                  e.putBoolean("slots10", true).apply()
+              }
 
               fun sp(c: Context) = c.getSharedPreferences("w", Context.MODE_PRIVATE)
               fun alpha(c: Context) = sp(c).getInt("alpha", 180)
@@ -729,78 +748,9 @@ jobs:
           package com.btcwidget
 
           import android.app.Activity
-          import android.content.ComponentName
-          import android.content.Context
           import android.content.Intent
-          import android.content.pm.LauncherActivityInfo
-          import android.content.pm.LauncherApps
-          import android.graphics.Bitmap
-          import android.os.Build
           import android.os.Bundle
-          import android.os.Process
-          import android.os.UserHandle
-          import android.os.UserManager
           import android.widget.Toast
-          import androidx.core.graphics.drawable.toBitmap
-
-          /** Apps of the other phone profiles (Samsung Secure Folder), seen and opened through the system's LauncherApps. */
-          object Sf {
-              class App(val label: String, val value: String)
-
-              private fun la(c: Context) = c.getSystemService(LauncherApps::class.java)
-              private fun um(c: Context) = c.getSystemService(UserManager::class.java)
-
-              fun otherProfiles(c: Context): List<UserHandle> {
-                  val me = Process.myUserHandle()
-                  val all: List<UserHandle> = try { if (Build.VERSION.SDK_INT >= 28) la(c).profiles else um(c).userProfiles } catch (_: Exception) { emptyList() }
-                  return all.filter { it != me }
-              }
-
-              fun apps(c: Context): List<App> = otherProfiles(c).flatMap { u ->
-                  val serial = um(c).getSerialNumberForUser(u)
-                  val list: List<LauncherActivityInfo> = try { la(c).getActivityList(null, u) } catch (_: Exception) { emptyList() }
-                  list.map { App(it.label.toString(), it.componentName.flattenToString() + "|" + serial) }
-              }.sortedBy { it.label.lowercase() }
-
-              private fun parse(c: Context, v: String): Pair<ComponentName, UserHandle>? {
-                  val parts = v.split("|")
-                  if (parts.size != 2) return null
-                  val cn = ComponentName.unflattenFromString(parts[0]) ?: return null
-                  val u = um(c).getUserForSerialNumber(parts[1].toLongOrNull() ?: return null) ?: return null
-                  return Pair(cn, u)
-              }
-
-              private fun info(c: Context, v: String): LauncherActivityInfo? {
-                  val (cn, u) = parse(c, v) ?: return null
-                  return try {
-                      la(c).resolveActivity(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER).setComponent(cn), u)
-                  } catch (_: Exception) { null }
-              }
-
-              fun label(c: Context, v: String): String =
-                  if (v.isEmpty()) "empty" else info(c, v)?.label?.toString() ?: v.substringBefore('/')
-
-              /** Icon with the Secure Folder badge, like on the home screen. */
-              fun icon(c: Context, v: String): Bitmap? = try { info(c, v)?.getBadgedIcon(0)?.toBitmap(96, 96) } catch (_: Exception) { null }
-
-              fun launch(c: Context, v: String) {
-                  val (cn, u) = parse(c, v) ?: throw Exception("app not found")
-                  la(c).startMainActivity(cn, u, null, null)
-              }
-          }
-
-          /** Invisible screen the widget's Secure Folder buttons open; it starts the chosen app inside Secure Folder. */
-          class SfLaunch : Activity() {
-              override fun onCreate(b: Bundle?) {
-                  super.onCreate(b)
-                  val v = intent.getStringExtra("v").orEmpty()
-                  try { Sf.launch(this, v) }
-                  catch (e: Exception) {
-                      Toast.makeText(applicationContext, "Could not open: " + (e.message ?: e.javaClass.simpleName), Toast.LENGTH_LONG).show()
-                  }
-                  finish()
-              }
-          }
 
           /** Invisible screen behind the widget's CHART button: opens the link saved in settings. */
           class ChartLaunch : Activity() {
@@ -857,6 +807,10 @@ jobs:
                           })
                       })
                   }
+                  root.addView(Button(this).apply {
+                      text = "Tradetron status: log in, alerts, text size of TT lines"
+                      setOnClickListener { startActivity(Intent(this@SettingsActivity, com.btcwidget.tt.TtSettingsActivity::class.java)) }
+                  })
                   seek("Widget transparency (left = clear, right = solid)", 255, Prefs.alpha(this)) {
                       sp.edit().putInt("alpha", it).apply() }
                   seek("Text size for prices, PnL, Pos and ADX (11-20)", 9, Prefs.tsize(this) - 11) {
@@ -875,11 +829,6 @@ jobs:
                   field("secret", "Delta API secret (optional backup)")
                   field("stratlink", "STRATEGIES button link: paste the link to open (e.g. your Tradetron deployed strategies page)")
                   field("chartlink", "CHART button link: paste the link of the chart you want (e.g. a TradingView or Delta chart link)")
-                  label("Extra prices for the INDICES pop-up (3 slots): a name and a symbol. Symbols: SOLUSD (Delta), idx:nifty-bank idx:sensex (angelone.in/indices/<name>), yahoo:^NSEBANK, bullions:mcx bullions:24k bullions:22k bullions:silver")
-                  for (i in 1..3) {
-                      field("c${i}l", "Index $i name (e.g. BANKNIFTY)")
-                      field("c${i}s", "Index $i symbol")
-                  }
                   field("pnlsrc", "PnL source: blank = widget calculation (recommended). Type delta to use Delta's own field (known to be wrong for options)")
                   field("fee", "Fee per open position in rupees, subtracted from PnL. Try 12. Blank = none")
                   field("rate", "USD-to-INR rate for PnL (blank = 85, Delta's fixed rate; type usd to show dollars)")
@@ -930,12 +879,6 @@ jobs:
                           }.start()
                       }
                   })
-                  root.addView(Button(this).apply {
-                      text = "Open Delta API page (to whitelist an IP)"
-                      setOnClickListener {
-                          startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://india.delta.exchange/app/account/manageapikeys")))
-                      }
-                  })
 
                   fun appName(pkg: String): String = if (pkg.isEmpty()) "empty" else try {
                       packageManager.getApplicationLabel(packageManager.getApplicationInfo(pkg, 0)).toString()
@@ -957,8 +900,9 @@ jobs:
                       }
                       root.addView(btn)
                   }
-                  label("Widget buttons: 6 per row, 2 rows. Pick any installed app for each.")
-                  Prefs.SLOT_KEYS.forEachIndexed { i, k -> pick(k, i + 1) }
+                  label("Widget buttons: 5 per row, 2 rows. Pick any installed app for each.")
+                  Prefs.migrateSlots(this)
+                  Prefs.SLOT_KEYS.take(10).forEachIndexed { i, k -> pick(k, i + 1) }
 
                   // ---------------- Secure Folder account (2nd Delta account) ----------------
                   root.addView(TextView(this).apply {
@@ -989,30 +933,6 @@ jobs:
                       }
                   })
 
-                  fun sfPick(k: String, n: Int) {
-                      val btn = Button(this)
-                      fun refresh() { btn.text = "Secure Folder button $n: " + Sf.label(this, sp.getString(k, "").orEmpty()) }
-                      refresh()
-                      btn.setOnClickListener {
-                          val apps = Sf.apps(this)
-                          if (apps.isEmpty()) {
-                              AlertDialog.Builder(this).setTitle("Secure Folder apps not visible")
-                                  .setMessage("This phone does not let other apps see the apps inside Secure Folder " +
-                                      "(profiles found: ${Sf.otherProfiles(this).size}). Unlock Secure Folder once and try again. " +
-                                      "If it still shows nothing, keep using the 3 Secure Folder shortcut icons on the home screen.")
-                                  .setPositiveButton("OK", null).show()
-                              return@setOnClickListener
-                          }
-                          AlertDialog.Builder(this).setTitle("Secure Folder button $n")
-                              .setItems((listOf("None (empty slot)") + apps.map { it.label }).toTypedArray()) { _, i ->
-                                  sp.edit().putString(k, if (i == 0) "" else apps[i - 1].value).apply()
-                                  refresh(); WidgetProvider.start(this)
-                              }.show()
-                      }
-                      root.addView(btn)
-                  }
-                  label("Secure Folder buttons (3, one row under the app buttons). They open the app inside Secure Folder.")
-                  Prefs.SF_KEYS.forEachIndexed { i, k -> sfPick(k, i + 1) }
 
                   setContentView(ScrollView(this).apply { addView(root) })
                   WidgetProvider.start(this)
@@ -1049,9 +969,8 @@ jobs:
               private val loop = Executors.newScheduledThreadPool(4)
               private var started = false
 
-              private val slotIds = listOf(R.id.btn1, R.id.btn2, R.id.btn3, R.id.btn4, R.id.btn5, R.id.btn6,
-                  R.id.btn7, R.id.btn8, R.id.btn9, R.id.btn10, R.id.btn11, R.id.btn12)
-              private val sfIds = listOf(R.id.sf1, R.id.sf2, R.id.sf3)
+              private val slotIds = listOf(R.id.btn1, R.id.btn2, R.id.btn3, R.id.btn4, R.id.btn5,
+                  R.id.btn6, R.id.btn7, R.id.btn8, R.id.btn9, R.id.btn10)
 
               override fun onBind(i: Intent?): IBinder? = null
 
@@ -1059,7 +978,7 @@ jobs:
                   super.onCreate()
                   val nm = getSystemService(NotificationManager::class.java)
                   nm.createNotificationChannel(NotificationChannel("w", "Widget refresh", NotificationManager.IMPORTANCE_MIN))
-                  val n = Notification.Builder(this, "w").setContentTitle("Merged widget running")
+                  val n = Notification.Builder(this, "w").setContentTitle("Stock Widget running")
                       .setSmallIcon(android.R.drawable.ic_dialog_info).build()
                   if (Build.VERSION.SDK_INT >= 34) startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
                   else startForeground(1, n)
@@ -1096,29 +1015,17 @@ jobs:
               /** Full update: icons + click targets. Text is refreshed by tick(). */
               private fun initWidget() {
                   val rv = RemoteViews(packageName, R.layout.widget)
-                  val pkgs = Prefs.SLOT_KEYS.map { Prefs.str(this, it) }
-                  for (i in 0 until 12) {
+                  Prefs.migrateSlots(this)
+                  val pkgs = Prefs.SLOT_KEYS.take(10).map { Prefs.str(this, it) }
+                  for (i in 0 until 10) {
                       val pkg = pkgs[i]
                       if (pkg.isEmpty()) { rv.setViewVisibility(slotIds[i], View.INVISIBLE); continue }
                       rv.setViewVisibility(slotIds[i], View.VISIBLE)
                       rv.setImageViewBitmap(slotIds[i], icon(pkg))
                       open(10 + i, pkg)?.let { rv.setOnClickPendingIntent(slotIds[i], it) }
                   }
-                  rv.setViewVisibility(R.id.row1, if (pkgs.subList(0, 6).any { it.isNotEmpty() }) View.VISIBLE else View.GONE)
-                  rv.setViewVisibility(R.id.row2, if (pkgs.subList(6, 12).any { it.isNotEmpty() }) View.VISIBLE else View.GONE)
-                  // Secure Folder buttons: opened through the invisible SfLaunch screen
-                  val sfs = Prefs.SF_KEYS.map { Prefs.str(this, it) }
-                  for (i in 0 until 3) {
-                      val v = sfs[i]
-                      val bmp = if (v.isEmpty()) null else Sf.icon(this, v)
-                      if (v.isEmpty()) { rv.setViewVisibility(sfIds[i], View.GONE); continue }
-                      rv.setViewVisibility(sfIds[i], View.VISIBLE)
-                      rv.setImageViewBitmap(sfIds[i], bmp ?: getDrawable(android.R.drawable.sym_def_app_icon)!!.toBitmap(96, 96))
-                      rv.setOnClickPendingIntent(sfIds[i], PendingIntent.getActivity(this, 40 + i,
-                          Intent(this, SfLaunch::class.java).putExtra("v", v).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
-                          PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT))
-                  }
-                  rv.setViewVisibility(R.id.row3, if (sfs.any { it.isNotEmpty() }) View.VISIBLE else View.GONE)
+                  rv.setViewVisibility(R.id.row1, if (pkgs.subList(0, 5).any { it.isNotEmpty() }) View.VISIBLE else View.GONE)
+                  rv.setViewVisibility(R.id.row2, if (pkgs.subList(5, 10).any { it.isNotEmpty() }) View.VISIBLE else View.GONE)
                   rv.setOnClickPendingIntent(R.id.idxbtn, PendingIntent.getActivity(this, 4,
                       Intent(this, IndexActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK), PendingIntent.FLAG_IMMUTABLE))
                   rv.setOnClickPendingIntent(R.id.chartbtn, PendingIntent.getActivity(this, 5,
@@ -1128,6 +1035,7 @@ jobs:
                   rv.setOnClickPendingIntent(R.id.gear, PendingIntent.getActivity(this, 3,
                       Intent(this, SettingsActivity::class.java), PendingIntent.FLAG_IMMUTABLE))
                   AppWidgetManager.getInstance(this).updateAppWidget(ids(), rv)
+                  com.btcwidget.tt.TtService.start(this)   // puts the Tradetron lines back after the full redraw
               }
 
               private fun <T> async(f: () -> T): Future<T?> = pool.submit(Callable<T?> { try { f() } catch (e: Exception) { null } })
@@ -1254,6 +1162,7 @@ jobs:
               companion object {
                   fun start(c: Context) {
                       try { c.startForegroundService(Intent(c, UpdateService::class.java)) } catch (_: Exception) {}
+                      com.btcwidget.tt.TtService.start(c)
                   }
               }
           }
@@ -1261,6 +1170,921 @@ jobs:
           class BootReceiver : BroadcastReceiver() {
               override fun onReceive(c: Context, i: Intent) = WidgetProvider.start(c)
           }
+          END_OF_FILE_X
+
+          mkdir -p 'app/src/main/java/com/btcwidget/tt'
+          cat > 'app/src/main/java/com/btcwidget/tt/Core.kt' <<'END_OF_FILE_X'
+          package com.btcwidget.tt
+
+          import android.content.Context
+          import android.content.Intent
+
+          enum class Level { BAD, WARN, LIVE, IDLE, DONE }
+
+          data class Row(val name: String, val status: String, val id: String) {
+              val key: String get() = id.ifEmpty { name }
+          }
+
+          object Status {
+              fun norm(s: String) = s.lowercase().filter { it in 'a'..'z' }
+
+              fun level(s: String): Level = when (norm(s)) {
+                  "errorexecution", "error", "blocked" -> Level.BAD
+                  "exitpending", "awaitingoneclick", "livetranching", "paused" -> Level.WARN
+                  "liveentered" -> Level.LIVE
+                  "exited", "archived" -> Level.DONE
+                  else -> Level.IDLE
+              }
+
+              fun color(l: Level): Int = when (l) {
+                  Level.BAD -> 0xFFFF5A5F.toInt()
+                  Level.WARN -> 0xFFFFC145.toInt()
+                  Level.LIVE -> 0xFF4CD964.toInt()
+                  Level.IDLE -> 0xFFCFD8DC.toInt()
+                  Level.DONE -> 0xFF78858C.toInt()
+              }
+          }
+
+          /** Latest reading, shared between the service, the widget and the settings screen. */
+          object State {
+              @Volatile var rows: List<Row> = emptyList()
+              @Volatile var lastOk = 0L
+              @Volatile var src = ""
+              @Volatile var login = false
+              @Volatile var note = ""
+              @Volatile var api = ""
+              @Volatile var href = ""
+          }
+
+          object Prefs {
+              const val DASH = "https://tradetron.tech/user/dashboard"
+              const val LOGIN = "https://tradetron.tech/login"
+
+              fun sp(c: Context) = c.getSharedPreferences("tt", Context.MODE_PRIVATE)
+              fun str(c: Context, k: String) = sp(c).getString(k, "")!!.trim()
+              fun interval(c: Context) = sp(c).getInt("interval", 5).coerceIn(2, 300)
+              fun reload(c: Context) = sp(c).getInt("reload", 30).coerceIn(10, 3600)
+              fun alpha(c: Context) = sp(c).getInt("alpha", 200)
+              fun tsize(c: Context) = sp(c).getInt("tsize", 13)
+              fun alerts(c: Context) = sp(c).getBoolean("alerts", true)
+              fun alarm(c: Context) = sp(c).getBoolean("alarm", true)
+              fun hideExited(c: Context) = sp(c).getBoolean("hideExited", true)
+              fun changeBeep(c: Context) = sp(c).getBoolean("changeBeep", false)
+
+              /** Package of the Tradetron app opened by a widget tap: the saved choice, else any installed app named tradetron. */
+              fun ttPkg(c: Context): String {
+                  val s = str(c, "ttpkg")
+                  if (s == "-") return ""
+                  if (s.isNotEmpty()) return s
+                  return try {
+                      val i = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+                      c.packageManager.queryIntentActivities(i, 0)
+                          .map { it.activityInfo.packageName }
+                          .firstOrNull { it.contains("tradetron", true) } ?: ""
+                  } catch (e: Exception) { "" }
+              }
+          }
+          END_OF_FILE_X
+
+          mkdir -p 'app/src/main/java/com/btcwidget/tt'
+          cat > 'app/src/main/java/com/btcwidget/tt/TtService.kt' <<'END_OF_FILE_X'
+          package com.btcwidget.tt
+
+          import android.annotation.SuppressLint
+          import android.app.*
+          import android.appwidget.AppWidgetManager
+          import android.content.ComponentName
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.graphics.Typeface
+          import android.content.Context
+          import android.media.AudioManager
+          import android.media.ToneGenerator
+          import android.widget.RemoteViewsService
+          import com.btcwidget.R
+          import com.btcwidget.WidgetProvider
+          import android.os.Build
+          import android.os.Handler
+          import android.os.IBinder
+          import android.os.Looper
+          import android.text.SpannableStringBuilder
+          import android.text.Spanned
+          import android.text.style.ForegroundColorSpan
+          import android.text.style.StyleSpan
+          import android.util.TypedValue
+          import android.view.View
+          import android.webkit.CookieManager
+          import android.webkit.JavascriptInterface
+          import android.webkit.WebView
+          import android.webkit.WebViewClient
+          import android.widget.RemoteViews
+          import androidx.webkit.WebViewCompat
+          import androidx.webkit.WebViewFeature
+          import org.json.JSONArray
+          import org.json.JSONObject
+
+          class TtService : Service() {
+              companion object {
+                  fun start(c: Context, action: String? = null) {
+                      try {
+                          val i = Intent(c, TtService::class.java)
+                          if (action != null) i.action = action
+                          c.startForegroundService(i)
+                      } catch (_: Exception) {}
+                  }
+
+                  /** Rows shown in the widget list (already filtered and sorted) and their text size. */
+                  @Volatile var shown: List<Row> = emptyList()
+                  @Volatile var shownTs = 13f
+                  const val ACT_RELOAD = "com.btcwidget.tt.RELOAD"
+                  const val ACT_STOP_SOUND = "com.btcwidget.tt.STOP_SOUND"
+                  const val ACT_TEST = "com.btcwidget.tt.TEST"
+                  const val ACT_RENDER = "com.btcwidget.tt.RENDER"
+                  private const val CALL = "(function(){if(!window.__ttTick){return 'noinit';}" +
+                      "window.__ttTick().then(function(r){TTB.report(JSON.stringify(r));})" +
+                      ".catch(function(e){TTB.report(JSON.stringify({err:String(e)}));});return 'ok';})()"
+              }
+
+              private val h = Handler(Looper.getMainLooper())
+              private var wv: WebView? = null
+              private var probe = ""
+              private var started = false
+              private var lastLoad = 0L
+              private var pending = false
+              private var pendingAt = 0L
+              private val prev = HashMap<String, String>()
+              private val since = HashMap<String, Long>()
+              private val alerted = HashMap<String, String>()
+              private var staleAlerted = false
+              private var loginAlerted = false
+              private var tone: ToneGenerator? = null
+              private var beepUntil = 0L
+              private var startedAt = 0L
+              private var lastSig = ""
+
+              override fun onBind(i: Intent?): IBinder? = null
+
+              override fun onCreate() {
+                  super.onCreate()
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(NotificationChannel("run", "Status refresh", NotificationManager.IMPORTANCE_MIN))
+                  val ch = NotificationChannel("alert", "Tradetron alerts", NotificationManager.IMPORTANCE_HIGH)
+                  ch.enableVibration(true)
+                  ch.vibrationPattern = longArrayOf(0, 600, 300, 600, 300, 600)
+                  ch.setBypassDnd(true)
+                  ch.lockscreenVisibility = Notification.VISIBILITY_PUBLIC
+                  nm.createNotificationChannel(ch)
+                  val n = Notification.Builder(this, "run").setContentTitle("Stock Widget watching Tradetron")
+                      .setSmallIcon(android.R.drawable.ic_dialog_info).build()
+                  if (Build.VERSION.SDK_INT >= 34) startForeground(7, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+                  else startForeground(7, n)
+                  probe = try { assets.open("probe.js").bufferedReader().use { it.readText() } } catch (e: Exception) { "" }
+                  startedAt = System.currentTimeMillis()
+              }
+
+              override fun onStartCommand(i: Intent?, f: Int, id: Int): Int {
+                  if (!started) {
+                      started = true
+                      setupWebView()
+                      loadDash()
+                      h.postDelayed(loop, 3000)
+                  }
+                  when (i?.action) {
+                      ACT_RELOAD -> { loginAlerted = false; loadDash() }
+                      ACT_STOP_SOUND -> stopSound()
+                      ACT_TEST -> alert(3, "Tradetron test alert", "This is how a Tradetron error alert will look and sound.", true)
+                  }
+                  initWidget()
+                  render()
+                  return START_STICKY
+              }
+
+              // ---------------------------------------------------------------- web reader
+
+              inner class Bridge {
+                  @JavascriptInterface
+                  fun report(json: String) { h.post { pending = false; try { handle(json) } catch (_: Throwable) {} } }
+              }
+
+              @SuppressLint("SetJavaScriptEnabled")
+              private fun setupWebView() {
+                  val w = WebView(this)
+                  val s = w.settings
+                  s.javaScriptEnabled = true
+                  s.domStorageEnabled = true
+                  s.userAgentString = s.userAgentString.replace("; wv", "")
+                  CookieManager.getInstance().setAcceptCookie(true)
+                  CookieManager.getInstance().setAcceptThirdPartyCookies(w, true)
+                  w.addJavascriptInterface(Bridge(), "TTB")
+                  if (probe.isNotEmpty() && WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
+                      try { WebViewCompat.addDocumentStartJavaScript(w, probe, setOf("*")) } catch (_: Exception) {}
+                  }
+                  w.webViewClient = object : WebViewClient() {
+                      override fun onPageFinished(v: WebView, url: String) { if (probe.isNotEmpty()) v.evaluateJavascript(probe, null) }
+                  }
+                  // give the page a phone-sized screen so it lays out normally while hidden
+                  w.measure(View.MeasureSpec.makeMeasureSpec(1080, View.MeasureSpec.EXACTLY),
+                      View.MeasureSpec.makeMeasureSpec(2200, View.MeasureSpec.EXACTLY))
+                  w.layout(0, 0, 1080, 2200)
+                  w.onResume()
+                  w.resumeTimers()
+                  wv = w
+              }
+
+              private fun loadDash() {
+                  lastLoad = System.currentTimeMillis()
+                  pending = false
+                  wv?.loadUrl(Prefs.DASH)
+              }
+
+              private val loop = object : Runnable {
+                  override fun run() {
+                      try { tick() } catch (_: Throwable) {}
+                      h.postDelayed(this, Prefs.interval(this@TtService) * 1000L)
+                  }
+              }
+
+              private fun tick() {
+                  val now = System.currentTimeMillis()
+                  val reloadMs = when {
+                      State.login -> 60_000L
+                      State.src == "api" -> 15 * 60_000L
+                      else -> Prefs.reload(this) * 1000L
+                  }
+                  if (now - lastLoad > reloadMs) loadDash()
+                  else if (!pending || now - pendingAt > 20_000) {
+                      pending = true; pendingAt = now
+                      wv?.evaluateJavascript(CALL) { v ->
+                          if (v != null && v.contains("noinit")) { pending = false; if (probe.isNotEmpty()) wv?.evaluateJavascript(probe, null) }
+                      }
+                  }
+                  checkStale(now)
+                  render()
+              }
+
+              private fun handle(json: String) {
+                  val o = JSONObject(json)
+                  val now = System.currentTimeMillis()
+                  State.href = o.optString("href")
+                  if (o.optBoolean("login")) {
+                      State.login = true
+                      State.note = "Logged out - open the app and log in"
+                      if (!loginAlerted && Prefs.alerts(this)) {
+                          loginAlerted = true
+                          alert(4, "Tradetron logged out", "Stock Widget can't see your strategies. Open the TT settings (gear on the TT line) and log in again.", true)
+                      }
+                      render(); return
+                  }
+                  if (o.has("err")) { State.note = o.optString("err").take(120); render(); return }
+                  State.login = false
+                  loginAlerted = false
+                  val arr = o.optJSONArray("rows") ?: JSONArray()
+                  val seen = HashSet<String>()
+                  val rows = ArrayList<Row>()
+                  for (k in 0 until arr.length()) {
+                      val r = arr.optJSONObject(k) ?: continue
+                      val row = Row(r.optString("n").trim(), r.optString("s").trim(), r.optString("id").trim())
+                      if (row.status.isEmpty() || !seen.add(row.key + "|" + row.status)) continue
+                      rows.add(row)
+                  }
+                  State.src = o.optString("src")
+                  State.api = o.optString("api")
+                  State.note = o.optString("apiErr")
+                  if (rows.isEmpty()) {
+                      if (State.note.isEmpty()) State.note = "page open, no strategies read yet"
+                  } else {
+                      State.rows = rows
+                      State.lastOk = now
+                      staleAlerted = false
+                      checkAlerts(rows, now)
+                  }
+                  render()
+              }
+
+              // ---------------------------------------------------------------- alerts
+
+              private fun checkAlerts(rows: List<Row>, now: Long) {
+                  val bad = ArrayList<String>()
+                  val changes = ArrayList<String>()
+                  for (r in rows) {
+                      val k = r.key
+                      val st = Status.norm(r.status)
+                      val old = prev[k]
+                      if (old != st) {
+                          since[k] = now
+                          prev[k] = st
+                          if (old != null) changes.add("${r.name.ifEmpty { r.id }}: ${r.status}")
+                      }
+                      val dur = now - (since[k] ?: now)
+                      val trigger = when {
+                          Status.level(r.status) == Level.BAD -> true
+                          st == "awaitingoneclick" -> true
+                          st == "exitpending" && dur > 30_000 -> true
+                          st == "livetranching" && dur > 60_000 -> true
+                          else -> false
+                      }
+                      if (trigger) {
+                          if (alerted[k] != st) { alerted[k] = st; bad.add("${r.name.ifEmpty { r.id }}: ${r.status}") }
+                      } else alerted.remove(k)
+                  }
+                  if (!Prefs.alerts(this)) return
+                  if (bad.isNotEmpty()) alert(2, "⚠ Tradetron: ${bad.size} need attention", bad.joinToString("\n"), true)
+                  else if (changes.isNotEmpty() && Prefs.changeBeep(this)) alert(6, "Tradetron status changed", changes.joinToString("\n"), false)
+              }
+
+              private fun checkStale(now: Long) {
+                  if (State.login || !Prefs.alerts(this)) return
+                  val ref = if (State.lastOk > 0) State.lastOk else startedAt
+                  if (now - ref > 180_000 && !staleAlerted) {
+                      staleAlerted = true
+                      alert(5, "Tradetron status not updating", "No fresh Tradetron status for 3 minutes. Check internet, or open the TT settings and log in.", true)
+                  }
+              }
+
+              private fun openPi(code: Int): PendingIntent = PendingIntent.getActivity(this, code,
+                  Intent(this, OpenActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                  PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+
+              private fun alert(id: Int, title: String, text: String, loud: Boolean) {
+                  val stop = PendingIntent.getService(this, 90 + id,
+                      Intent(this, TtService::class.java).setAction(ACT_STOP_SOUND), PendingIntent.FLAG_IMMUTABLE)
+                  val n = Notification.Builder(this, "alert")
+                      .setContentTitle(title).setContentText(text)
+                      .setStyle(Notification.BigTextStyle().bigText(text))
+                      .setSmallIcon(android.R.drawable.stat_sys_warning)
+                      .setCategory(Notification.CATEGORY_ALARM)
+                      .setAutoCancel(true)
+                      .setContentIntent(openPi(70 + id))
+                      .setDeleteIntent(stop)
+                      .build()
+                  getSystemService(NotificationManager::class.java).notify(id, n)
+                  if (loud && Prefs.alarm(this)) playAlarm()
+              }
+
+              /** Shrill high-pitched double beep, repeated for 20 s (or until the alert is tapped / dismissed). */
+              private fun playAlarm() {
+                  stopSound()
+                  try {
+                      tone = ToneGenerator(AudioManager.STREAM_ALARM, 100)
+                      beepUntil = System.currentTimeMillis() + 20_000
+                      h.post(beep)
+                  } catch (_: Exception) {}
+              }
+
+              private val beep = object : Runnable {
+                  override fun run() {
+                      val t = tone ?: return
+                      if (System.currentTimeMillis() > beepUntil) { stopSound(); return }
+                      try { t.startTone(ToneGenerator.TONE_CDMA_HIGH_SS, 700) } catch (_: Exception) {}
+                      h.postDelayed(this, 1300)
+                  }
+              }
+
+              private fun stopSound() {
+                  h.removeCallbacks(beep)
+                  try { tone?.stopTone() } catch (_: Exception) {}
+                  try { tone?.release() } catch (_: Exception) {}
+                  tone = null
+              }
+
+              // ---------------------------------------------------------------- widget
+
+              private fun ids() = AppWidgetManager.getInstance(this)
+                  .getAppWidgetIds(ComponentName(this, WidgetProvider::class.java))
+
+              /** Only the Tradetron part of the Stock Widget (partial update, so prices / PnL are left alone). */
+              private fun initWidget() {
+                  val rv = RemoteViews(packageName, R.layout.widget)
+                  rv.setOnClickPendingIntent(R.id.tthead, openPi(1))
+                  rv.setOnClickPendingIntent(R.id.ttgear, PendingIntent.getActivity(this, 3,
+                      Intent(this, TtSettingsActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK), PendingIntent.FLAG_IMMUTABLE))
+                  rv.setRemoteAdapter(R.id.ttlist, Intent(this, TtListService::class.java))
+                  rv.setPendingIntentTemplate(R.id.ttlist, PendingIntent.getActivity(this, 8,
+                      Intent(this, OpenActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                      PendingIntent.FLAG_MUTABLE or PendingIntent.FLAG_UPDATE_CURRENT))
+                  AppWidgetManager.getInstance(this).partiallyUpdateAppWidget(ids(), rv)
+                  lastSig = ""
+              }
+
+              private fun age(ms: Long): String {
+                  val s = ms / 1000
+                  return if (s < 60) "${s}s" else if (s < 3600) "${s / 60}m" else "${s / 3600}h"
+              }
+
+              private fun render() {
+                  val rv = RemoteViews(packageName, R.layout.widget)
+                  val now = System.currentTimeMillis()
+                  val ts = Prefs.tsize(this).toFloat()
+                  val order = listOf(Level.BAD, Level.WARN, Level.LIVE, Level.IDLE, Level.DONE)
+                  var rows = State.rows
+                  if (Prefs.hideExited(this)) rows = rows.filter { Status.level(it.status) != Level.DONE }
+                  rows = rows.sortedBy { order.indexOf(Status.level(it.status)) }
+                  val nBad = rows.count { Status.level(it.status) == Level.BAD }
+                  val nWarn = rows.count { Status.level(it.status) == Level.WARN }
+                  val stale = State.lastOk > 0 && now - State.lastOk > 60_000
+                  val (head, col) = when {
+                      State.login -> "TT  LOGIN NEEDED" to Status.color(Level.BAD)
+                      State.lastOk == 0L -> "TT  connecting…" to Status.color(Level.IDLE)
+                      stale -> "TT  NOT UPDATING" to Status.color(Level.BAD)
+                      nBad > 0 -> "TT  ⚠ $nBad ERROR" to Status.color(Level.BAD)
+                      nWarn > 0 -> "TT  ! $nWarn to check" to Status.color(Level.WARN)
+                      else -> "TT  ✓ all OK" to Status.color(Level.LIVE)
+                  }
+                  rv.setTextViewText(R.id.tthead, head)
+                  rv.setTextColor(R.id.tthead, col)
+                  rv.setTextViewTextSize(R.id.tthead, TypedValue.COMPLEX_UNIT_SP, ts + 2f)
+                  rv.setTextViewText(R.id.ttupd, if (State.lastOk == 0L) "" else age(now - State.lastOk))
+                  rv.setTextViewTextSize(R.id.ttupd, TypedValue.COMPLEX_UNIT_SP, ts - 2f)
+                  // list: 5 rows visible, the rest by scrolling
+                  shown = rows; shownTs = ts
+                  val vis = minOf(rows.size, 5)
+                  val rowDp = ts * 1.32f + 2f
+                  if (vis == 0) rv.setViewVisibility(R.id.ttlist, View.GONE)
+                  else {
+                      rv.setViewVisibility(R.id.ttlist, View.VISIBLE)
+                      if (Build.VERSION.SDK_INT >= 31) rv.setViewLayoutHeight(R.id.ttlist, vis * rowDp, TypedValue.COMPLEX_UNIT_DIP)
+                  }
+                  rv.setViewVisibility(R.id.ttempty, if (rows.isEmpty() && State.lastOk > 0) View.VISIBLE else View.GONE)
+                  val sig = ts.toString() + "|" + rows.joinToString("|") { it.status + "~" + it.name + "~" + it.id }
+                  if (sig != lastSig) {
+                      lastSig = sig
+                      AppWidgetManager.getInstance(this).notifyAppWidgetViewDataChanged(ids(), R.id.ttlist)
+                  }
+                  AppWidgetManager.getInstance(this).partiallyUpdateAppWidget(ids(), rv)
+              }
+
+              override fun onDestroy() {
+                  h.removeCallbacksAndMessages(null)
+                  stopSound()
+                  try { wv?.destroy() } catch (_: Exception) {}
+                  super.onDestroy()
+              }
+          }
+
+          /** Feeds the scrollable strategy list inside the widget. */
+          class TtListService : RemoteViewsService() {
+              override fun onGetViewFactory(i: Intent): RemoteViewsService.RemoteViewsFactory = object : RemoteViewsService.RemoteViewsFactory {
+                  private var rows: List<Row> = emptyList()
+                  private var ts = 13f
+                  override fun onCreate() {}
+                  override fun onDataSetChanged() { rows = TtService.shown; ts = TtService.shownTs }
+                  override fun onDestroy() {}
+                  override fun getCount() = rows.size
+                  override fun getViewAt(p: Int): RemoteViews {
+                      val rv = RemoteViews(packageName, R.layout.tt_row)
+                      val r = rows.getOrNull(p) ?: return rv
+                      val lv = Status.level(r.status)
+                      val sb = SpannableStringBuilder()
+                      sb.append(r.status)
+                      sb.setSpan(ForegroundColorSpan(Status.color(lv)), 0, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                      if (lv == Level.BAD || lv == Level.WARN) sb.setSpan(StyleSpan(Typeface.BOLD), 0, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                      sb.append("  ")
+                      sb.append(r.name.ifEmpty { r.id.ifEmpty { "?" } })
+                      rv.setTextViewText(R.id.ttrow, sb)
+                      rv.setTextViewTextSize(R.id.ttrow, TypedValue.COMPLEX_UNIT_SP, ts)
+                      rv.setOnClickFillInIntent(R.id.ttrow, Intent())
+                      return rv
+                  }
+                  override fun getLoadingView(): RemoteViews? = null
+                  override fun getViewTypeCount() = 1
+                  override fun getItemId(p: Int) = p.toLong()
+                  override fun hasStableIds() = false
+              }
+          }
+          END_OF_FILE_X
+
+          mkdir -p 'app/src/main/java/com/btcwidget/tt'
+          cat > 'app/src/main/java/com/btcwidget/tt/Screens.kt' <<'END_OF_FILE_X'
+          package com.btcwidget.tt
+
+          import android.annotation.SuppressLint
+          import android.app.Activity
+          import android.content.Context
+          import android.content.Intent
+          import android.os.Bundle
+          import android.webkit.CookieManager
+          import android.webkit.WebView
+          import android.webkit.WebViewClient
+
+          /** Invisible screen behind a widget or alert tap: silences the alarm, then opens the Tradetron app. */
+          class OpenActivity : Activity() {
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  TtService.start(this, TtService.ACT_STOP_SOUND)
+                  val pkg = Prefs.ttPkg(this)
+                  val launch = if (pkg.isEmpty()) null else packageManager.getLaunchIntentForPackage(pkg)
+                  try {
+                      startActivity(launch?.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                          ?: Intent(this, WebActivity::class.java).putExtra("url", Prefs.DASH).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                  } catch (_: Exception) {}
+                  finish()
+              }
+          }
+
+          /** Tradetron website inside the app: used to log in (the watcher shares this login) and as a full control panel. */
+          class WebActivity : Activity() {
+              private lateinit var w: WebView
+
+              @SuppressLint("SetJavaScriptEnabled")
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  title = "Tradetron"
+                  w = WebView(this)
+                  val s = w.settings
+                  s.javaScriptEnabled = true
+                  s.domStorageEnabled = true
+                  s.builtInZoomControls = true
+                  s.displayZoomControls = false
+                  s.userAgentString = s.userAgentString.replace("; wv", "")
+                  CookieManager.getInstance().setAcceptCookie(true)
+                  CookieManager.getInstance().setAcceptThirdPartyCookies(w, true)
+                  w.webViewClient = WebViewClient()
+                  setContentView(w)
+                  w.loadUrl(intent.getStringExtra("url") ?: Prefs.DASH)
+              }
+
+              @Deprecated("Deprecated in Java")
+              override fun onBackPressed() {
+                  if (w.canGoBack()) w.goBack() else super.onBackPressed()
+              }
+
+              override fun onPause() {
+                  super.onPause()
+                  CookieManager.getInstance().flush()
+              }
+
+              override fun onDestroy() {
+                  CookieManager.getInstance().flush()
+                  TtService.start(this, TtService.ACT_RELOAD)
+                  try { w.destroy() } catch (_: Exception) {}
+                  super.onDestroy()
+              }
+          }
+          END_OF_FILE_X
+
+          mkdir -p 'app/src/main/java/com/btcwidget/tt'
+          cat > 'app/src/main/java/com/btcwidget/tt/TtSettingsActivity.kt' <<'END_OF_FILE_X'
+          package com.btcwidget.tt
+
+          import android.app.Activity
+          import android.app.AlertDialog
+          import android.content.ClipData
+          import android.content.ClipboardManager
+          import android.content.Intent
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.os.PowerManager
+          import android.provider.Settings
+          import android.text.InputType
+          import android.view.View
+          import android.widget.*
+
+          class TtSettingsActivity : Activity() {
+              private val h = Handler(Looper.getMainLooper())
+              private lateinit var status: TextView
+              private lateinit var interval: EditText
+              private lateinit var reload: EditText
+              private lateinit var appBtn: Button
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  title = "Tradetron status"
+                  if (Build.VERSION.SDK_INT >= 33) requestPermissions(arrayOf("android.permission.POST_NOTIFICATIONS"), 1)
+                  TtService.start(this)
+                  val sp = Prefs.sp(this)
+
+                  val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(16), dp(12), dp(16), dp(24)) }
+                  fun label(t: String, size: Float = 14f) = TextView(this).apply { text = t; textSize = size; setPadding(0, dp(12), 0, dp(2)) }.also { col.addView(it) }
+                  fun button(t: String, f: () -> Unit) = Button(this).apply { text = t; isAllCaps = false; setOnClickListener { f() } }.also { col.addView(it) }
+                  fun number(key: String, def: Int) = EditText(this).apply {
+                      inputType = InputType.TYPE_CLASS_NUMBER; setText(sp.getInt(key, def).toString())
+                  }.also { col.addView(it) }
+                  fun switch(t: String, key: String, def: Boolean) = Switch(this).apply {
+                      text = t; textSize = 15f; isChecked = sp.getBoolean(key, def); setPadding(0, dp(8), 0, dp(8))
+                      setOnCheckedChangeListener { _, v -> sp.edit().putBoolean(key, v).apply(); TtService.start(this@TtSettingsActivity) }
+                  }.also { col.addView(it) }
+                  fun seek(t: String, key: String, def: Int, min: Int, max: Int) {
+                      val l = label("$t: ${sp.getInt(key, def)}")
+                      col.addView(SeekBar(this).apply {
+                          this.max = max - min; progress = sp.getInt(key, def) - min
+                          setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                              override fun onProgressChanged(s: SeekBar?, p: Int, u: Boolean) {
+                                  l.text = "$t: ${p + min}"; sp.edit().putInt(key, p + min).apply(); TtService.start(this@TtSettingsActivity)
+                              }
+                              override fun onStartTrackingTouch(s: SeekBar?) {}
+                              override fun onStopTrackingTouch(s: SeekBar?) {}
+                          })
+                      })
+                  }
+
+                  status = TextView(this).apply { textSize = 14f; setPadding(dp(10), dp(10), dp(10), dp(10)); setBackgroundColor(0xFFECEFF1.toInt()) }
+                  col.addView(status)
+
+                  label("1. Log in once (use email/mobile + password or OTP; Google sign-in may be blocked inside apps).")
+                  button("Log in to Tradetron") { startActivity(Intent(this, WebActivity::class.java).putExtra("url", Prefs.LOGIN)) }
+                  button("Open Tradetron dashboard here (pause / exit / fix)") {
+                      startActivity(Intent(this, WebActivity::class.java).putExtra("url", Prefs.DASH))
+                  }
+                  button("Reload now") { TtService.start(this, TtService.ACT_RELOAD) }
+
+                  label("Check status every (seconds)")
+                  interval = number("interval", 5)
+                  label("Reload the dashboard page every (seconds) - used only while reading the page directly")
+                  reload = number("reload", 30)
+                  button("Save timings") { saveNumbers(); Toast.makeText(this, "Saved", Toast.LENGTH_SHORT).show() }
+
+                  label("Alerts", 16f)
+                  switch("Alerts on errors / blocked / stuck / logged out", "alerts", true)
+                  switch("Loud double-beep alarm for those alerts (20 s)", "alarm", true)
+                  switch("Soft notification on every status change (entries / exits)", "changeBeep", false)
+                  button("Test alert") { TtService.start(this, TtService.ACT_TEST) }
+                  button("Allow running in background (battery)") { askBattery() }
+
+                  label("Widget", 16f)
+                  switch("Hide Exited / Archived strategies", "hideExited", true)
+                  seek("Text size of the Tradetron lines", "tsize", 13, 9, 22)
+                  appBtn = button("") { pickApp() }
+                  updateAppBtn()
+
+                  label("Help", 16f)
+                  button("Copy diagnostics (send to Claude if statuses look wrong)") { copyDiag() }
+
+                  setContentView(ScrollView(this).apply { addView(col) })
+                  h.post(tickUi)
+              }
+
+              private val tickUi = object : Runnable {
+                  override fun run() { showStatus(); h.postDelayed(this, 1000) }
+              }
+
+              private fun showStatus() {
+                  val now = System.currentTimeMillis()
+                  val s = StringBuilder()
+                  s.append(when {
+                      State.login -> "❌ Logged out of Tradetron - tap Log in"
+                      State.lastOk == 0L -> "⏳ Connecting to Tradetron…"
+                      now - State.lastOk > 60_000 -> "⚠ Not updating (last ${(now - State.lastOk) / 1000}s ago)"
+                      else -> "✅ Watching - updated ${(now - State.lastOk) / 1000}s ago"
+                  })
+                  s.append("\nStrategies read: ${State.rows.size}")
+                  if (State.src.isNotEmpty()) s.append("   (source: ${State.src})")
+                  if (State.note.isNotEmpty()) s.append("\nNote: ${State.note}")
+                  status.text = s
+              }
+
+              private fun saveNumbers() {
+                  val sp = Prefs.sp(this).edit()
+                  interval.text.toString().toIntOrNull()?.let { sp.putInt("interval", it.coerceIn(2, 300)) }
+                  reload.text.toString().toIntOrNull()?.let { sp.putInt("reload", it.coerceIn(10, 3600)) }
+                  sp.apply()
+              }
+
+              private fun updateAppBtn() {
+                  val pkg = Prefs.ttPkg(this)
+                  val name = if (pkg.isEmpty()) "not set (opens dashboard in this app)" else try {
+                      packageManager.getApplicationLabel(packageManager.getApplicationInfo(pkg, 0)).toString()
+                  } catch (e: Exception) { pkg }
+                  appBtn.text = "App opened by a widget tap: $name"
+              }
+
+              private fun pickApp() {
+                  val i = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+                  val apps = packageManager.queryIntentActivities(i, 0)
+                      .map { it.loadLabel(packageManager).toString() to it.activityInfo.packageName }
+                      .distinctBy { it.second }.sortedBy { it.first.lowercase() }
+                  val labels = (listOf("(none - open dashboard in this app)") + apps.map { it.first }).toTypedArray()
+                  AlertDialog.Builder(this).setTitle("App to open").setItems(labels) { _, w ->
+                      Prefs.sp(this).edit().putString("ttpkg", if (w == 0) "-" else apps[w - 1].second).apply()
+                      updateAppBtn()
+                  }.show()
+              }
+
+              private fun askBattery() {
+                  try {
+                      val pm = getSystemService(PowerManager::class.java)
+                      if (pm.isIgnoringBatteryOptimizations(packageName)) {
+                          Toast.makeText(this, "Already allowed", Toast.LENGTH_SHORT).show(); return
+                      }
+                      startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName")))
+                  } catch (e: Exception) {
+                      try { startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)) } catch (_: Exception) {}
+                  }
+              }
+
+              private fun copyDiag() {
+                  val d = StringBuilder()
+                  d.append("TT Status diagnostics\nsrc=${State.src}\napi=${State.api}\nhref=${State.href}\nlogin=${State.login}\n")
+                  d.append("lastOk=${if (State.lastOk == 0L) "never" else "${(System.currentTimeMillis() - State.lastOk) / 1000}s ago"}\n")
+                  d.append("note=${State.note}\nrows:\n")
+                  State.rows.forEach { d.append("- ${it.status} | ${it.name} | ${it.id}\n") }
+                  getSystemService(ClipboardManager::class.java).setPrimaryClip(ClipData.newPlainText("TT Status", d.toString()))
+                  Toast.makeText(this, "Copied", Toast.LENGTH_SHORT).show()
+              }
+
+              override fun onPause() { super.onPause(); saveNumbers() }
+              override fun onDestroy() { h.removeCallbacksAndMessages(null); super.onDestroy() }
+          }
+          END_OF_FILE_X
+
+          mkdir -p 'app/src/main/assets'
+          cat > 'app/src/main/assets/probe.js' <<'END_OF_FILE_X'
+          (function () {
+            if (window.__ttInit) return;
+            window.__ttInit = true;
+
+            var SET = { active: 1, liveentered: 1, livetranching: 1, paused: 1, blocked: 1, errorexecution: 1, error: 1,
+              exitpending: 1, exited: 1, archived: 1, awaitingoneclick: 1 };
+            function norm(s) { return String(s).toLowerCase().replace(/[^a-z]/g, ''); }
+            function isStatus(v) { return typeof v === 'string' && v.length > 0 && v.length < 32 && SET[norm(v)] === 1; }
+
+            function findStatus(o) {
+              var k, v, k2;
+              for (k in o) { v = o[k]; if (isStatus(v) && /status|state/i.test(k)) return v; }
+              for (k in o) { v = o[k]; if (isStatus(v)) return v; }
+              for (k in o) {
+                v = o[k];
+                if (v && typeof v === 'object' && !Array.isArray(v)) {
+                  for (k2 in v) { if (isStatus(v[k2])) return v[k2]; }
+                }
+              }
+              return null;
+            }
+
+            function findName(o) {
+              var k, v, k2;
+              for (k in o) { v = o[k]; if (typeof v === 'string' && /^(strategy_?name|template_?name|deployment_?name|name|title)$/i.test(k) && v.trim()) return v.trim(); }
+              for (k in o) {
+                v = o[k];
+                if (v && typeof v === 'object' && !Array.isArray(v) && /template|strategy|deployment/i.test(k)) {
+                  for (k2 in v) { if (typeof v[k2] === 'string' && /^(name|title|strategy_?name|template_?name)$/i.test(k2) && v[k2].trim()) return v[k2].trim(); }
+                }
+              }
+              for (k in o) {
+                v = o[k];
+                if (typeof v === 'string' && v.length > 2 && v.length < 80 && /[a-z]/i.test(v) && !isStatus(v) &&
+                    !/^https?:|^\d{4}-\d\d-\d\d|@/.test(v)) return v.trim();
+              }
+              return '';
+            }
+
+            function findSid(o) {
+              var k, v;
+              for (k in o) { v = o[k]; if (/^(sid|deployment_?id|deployed_?id)$/i.test(k) && (typeof v === 'number' || /^\d+$/.test(String(v)))) return String(v); }
+              for (k in o) { v = o[k]; if (/^id$/i.test(k) && (typeof v === 'number' || /^\d+$/.test(String(v)))) return String(v); }
+              return '';
+            }
+
+            function extract(j) {
+              var best = null, bestCnt = 0, queue = [[j, 0]], seen = 0;
+              while (queue.length && seen < 5000) {
+                var it = queue.shift(), o = it[0], d = it[1];
+                seen++;
+                if (!o || typeof o !== 'object' || d > 7) continue;
+                if (Array.isArray(o)) {
+                  var cnt = 0;
+                  for (var i = 0; i < o.length; i++) { if (o[i] && typeof o[i] === 'object' && !Array.isArray(o[i]) && findStatus(o[i])) cnt++; }
+                  if (cnt > bestCnt && cnt >= Math.max(1, Math.floor(o.length / 2))) { best = o; bestCnt = cnt; }
+                  for (var a = 0; a < o.length && a < 300; a++) queue.push([o[a], d + 1]);
+                } else {
+                  for (var k in o) queue.push([o[k], d + 1]);
+                }
+              }
+              var rows = [];
+              if (!best) return rows;
+              for (var b = 0; b < best.length; b++) {
+                var x = best[b];
+                if (!x || typeof x !== 'object') continue;
+                var s = findStatus(x);
+                if (!s) continue;
+                rows.push({ n: findName(x).slice(0, 60), s: s, id: findSid(x) });
+              }
+              return rows;
+            }
+
+            function countStatusLines(t) {
+              var c = 0, ls = String(t).split('\n');
+              for (var i = 0; i < ls.length; i++) if (isStatus(ls[i].trim())) c++;
+              return c;
+            }
+
+            function domRows() {
+              var out = [], seen = [], els = document.querySelectorAll('body *');
+              for (var i = 0; i < els.length; i++) {
+                var e = els[i];
+                var t = (e.textContent || '').trim();
+                if (!isStatus(t)) continue;
+                var deeper = false;
+                for (var c = 0; c < e.children.length; c++) { if ((e.children[c].textContent || '').trim() === t) { deeper = true; break; } }
+                if (deeper) continue;
+                if (e.closest('select,option,[role=option],[role=menu],[role=menuitem],[role=listbox],[role=tab],nav,header,button')) continue;
+                if (e.getClientRects().length === 0) continue;
+                var row = e.closest('tr');
+                if (!row) {
+                  row = e;
+                  for (var d = 0; d < 10 && row.parentElement && row.parentElement !== document.body; d++) {
+                    var p = row.parentElement, pt = p.innerText || '';
+                    if (countStatusLines(pt) > 1 || pt.length > 700) break;
+                    row = p;
+                  }
+                }
+                if (seen.indexOf(row) >= 0) continue;
+                seen.push(row);
+                var all = row.innerText || '';
+                var lines = all.split('\n').map(function (s) { return s.trim(); }).filter(Boolean);
+                var name = '';
+                for (var k = 0; k < lines.length; k++) {
+                  var s = lines[k];
+                  if (isStatus(s) || s.length < 3) continue;
+                  if (/^[\d\s.,:+\-()%₹$]+$/.test(s)) continue;
+                  if (/^(sid|live|offline|run|capital|p\s*&?\s*l|pnl|broker|multiplier|positions?|open|total|status|strategy)\b/i.test(s) && s.length < 16) continue;
+                  name = s; break;
+                }
+                var m = all.match(/\b(9\d{8})\b/);
+                out.push({ n: name.slice(0, 60), s: t, id: m ? m[1] : '' });
+              }
+              return out;
+            }
+
+            // ---- capture the dashboard's own data request so it can be repeated cheaply
+            function consider(url, method, body, hdrs, text) {
+              try {
+                if (!text || text.length > 4000000) return;
+                if (!/entered|exited|paused|active|error|blocked/i.test(text)) return;
+                var j = JSON.parse(text);
+                var rows = extract(j);
+                if (rows.length && rows.length >= (window.__ttBest || 0) && (!method || /^get$/i.test(method) || typeof body === 'string')) {
+                  window.__ttBest = rows.length;
+                  window.__ttReq = { url: new URL(url, location.href).href, method: method || 'GET', body: body, hdrs: hdrs || {} };
+                  window.__ttRows = rows;
+                  window.__ttAt = Date.now();
+                }
+              } catch (e) {}
+            }
+
+            var of = window.fetch;
+            window.__ttOrigFetch = of ? of.bind(window) : null;
+            if (of) {
+              window.fetch = function (input, init) {
+                var url = (typeof input === 'string') ? input : (input && input.url);
+                var m = (init && init.method) || (input && input.method) || 'GET';
+                var b = init && init.body;
+                var h = {};
+                try {
+                  var hh = (init && init.headers) || (input && input.headers);
+                  if (hh) { if (hh.forEach) hh.forEach(function (v, k) { h[k] = v; }); else for (var k in hh) h[k] = hh[k]; }
+                } catch (e) {}
+                return of.apply(this, arguments).then(function (r) {
+                  try { r.clone().text().then(function (t) { consider(url, m, typeof b === 'string' ? b : null, h, t); }); } catch (e) {}
+                  return r;
+                });
+              };
+            }
+
+            var XP = XMLHttpRequest.prototype, XO = XP.open, XS = XP.send, XH = XP.setRequestHeader;
+            XP.open = function (m, u) { this.__m = m; this.__u = u; this.__h = {}; return XO.apply(this, arguments); };
+            XP.setRequestHeader = function (k, v) { try { if (this.__h) this.__h[k] = v; } catch (e) {} return XH.apply(this, arguments); };
+            XP.send = function (b) {
+              var x = this;
+              try {
+                x.addEventListener('load', function () {
+                  try {
+                    var t = (x.responseType === '' || x.responseType === 'text') ? x.responseText
+                      : (x.responseType === 'json' ? JSON.stringify(x.response) : null);
+                    consider(x.__u, x.__m, typeof b === 'string' ? b : null, x.__h, t);
+                  } catch (e) {}
+                });
+              } catch (e) {}
+              return XS.apply(this, arguments);
+            };
+
+            window.__ttTick = async function () {
+              var res = { href: location.href };
+              if (/login|signin|sign-in|register/i.test(location.pathname)) { res.login = true; return res; }
+              var rows = null, src = '', q = window.__ttReq;
+              if (q && q.url && window.__ttOrigFetch) {
+                try {
+                  var init = { method: q.method || 'GET', credentials: 'include', headers: q.hdrs || {} };
+                  if (q.body && !/^get$/i.test(init.method)) init.body = q.body;
+                  var r = await window.__ttOrigFetch(q.url, init);
+                  if ((r.redirected && /login/i.test(r.url)) || r.status === 401 || r.status === 419) { res.login = true; return res; }
+                  var t = await r.text();
+                  rows = extract(JSON.parse(t));
+                  if (rows.length) { src = 'api'; window.__ttRows = rows; window.__ttAt = Date.now(); }
+                } catch (e) { res.apiErr = String(e).slice(0, 120); }
+              }
+              if (!rows || !rows.length) {
+                rows = domRows(); src = 'page';
+                if (!rows.length && window.__ttRows && Date.now() - (window.__ttAt || 0) < 20000) { rows = window.__ttRows; src = 'hook'; }
+              }
+              res.rows = rows; res.src = src; res.api = q ? q.url : '';
+              return res;
+            };
+          })();
           END_OF_FILE_X
 
           mkdir -p 'app/src/main/res/drawable'
@@ -1297,6 +2121,23 @@ jobs:
                   android:scaleType="fitXY" android:src="@drawable/bg"/>
               <LinearLayout android:layout_width="match_parent" android:layout_height="match_parent"
                   android:orientation="vertical" android:padding="8dp">
+                  <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+                      android:orientation="horizontal" android:gravity="center_vertical">
+                      <TextView android:id="@+id/tthead" android:layout_width="0dp" android:layout_weight="1"
+                          android:layout_height="wrap_content" android:text="TT  starting…" android:textColor="#FFFFFF"
+                          android:textSize="15sp" android:textStyle="bold" android:singleLine="true" android:ellipsize="end"/>
+                      <TextView android:id="@+id/ttupd" android:layout_width="wrap_content" android:layout_height="wrap_content"
+                          android:textColor="#AAAAAA" android:textSize="11sp" android:layout_marginEnd="8dp"/>
+                      <ImageView android:id="@+id/ttgear" android:layout_width="24dp" android:layout_height="24dp"
+                          android:src="@android:drawable/ic_menu_manage" android:alpha="0.8"/>
+                  </LinearLayout>
+                  <TextView android:id="@+id/ttempty" android:layout_width="match_parent" android:layout_height="wrap_content"
+                      android:text="No running strategies" android:textColor="#AAAAAA" android:textSize="12sp"
+                      android:visibility="gone" android:paddingTop="2dp"/>
+                  <ListView android:id="@+id/ttlist" android:layout_width="match_parent" android:layout_height="90dp"
+                      android:divider="@null" android:dividerHeight="0dp" android:scrollbars="vertical"
+                      android:listSelector="@android:color/transparent" android:visibility="gone"/>
+                  <View android:layout_width="match_parent" android:layout_height="8dp"/>
                   <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
                       android:orientation="horizontal" android:gravity="center_vertical">
                       <TextView android:id="@+id/price" android:layout_width="wrap_content" android:layout_height="wrap_content"
@@ -1366,11 +2207,11 @@ jobs:
                           android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
                       <ImageView android:id="@+id/btn5" android:layout_width="44dp" android:layout_height="match_parent"
                           android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
-                      <ImageView android:id="@+id/btn6" android:layout_width="44dp" android:layout_height="match_parent"
-                          android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
                   </LinearLayout>
                   <LinearLayout android:id="@+id/row2" android:layout_width="match_parent" android:layout_height="44dp"
                       android:layout_marginTop="3dp" android:orientation="horizontal" android:gravity="center">
+                      <ImageView android:id="@+id/btn6" android:layout_width="44dp" android:layout_height="match_parent"
+                          android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
                       <ImageView android:id="@+id/btn7" android:layout_width="44dp" android:layout_height="match_parent"
                           android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
                       <ImageView android:id="@+id/btn8" android:layout_width="44dp" android:layout_height="match_parent"
@@ -1379,22 +2220,18 @@ jobs:
                           android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
                       <ImageView android:id="@+id/btn10" android:layout_width="44dp" android:layout_height="match_parent"
                           android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
-                      <ImageView android:id="@+id/btn11" android:layout_width="44dp" android:layout_height="match_parent"
-                          android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
-                      <ImageView android:id="@+id/btn12" android:layout_width="44dp" android:layout_height="match_parent"
-                          android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
-                  </LinearLayout>
-                  <LinearLayout android:id="@+id/row3" android:layout_width="match_parent" android:layout_height="44dp"
-                      android:layout_marginTop="3dp" android:orientation="horizontal" android:gravity="center">
-                      <ImageView android:id="@+id/sf1" android:layout_width="44dp" android:layout_height="match_parent"
-                          android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
-                      <ImageView android:id="@+id/sf2" android:layout_width="44dp" android:layout_height="match_parent"
-                          android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
-                      <ImageView android:id="@+id/sf3" android:layout_width="44dp" android:layout_height="match_parent"
-                          android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
                   </LinearLayout>
               </LinearLayout>
           </FrameLayout>
+          END_OF_FILE_X
+
+          mkdir -p 'app/src/main/res/layout'
+          cat > 'app/src/main/res/layout/tt_row.xml' <<'END_OF_FILE_X'
+          <?xml version="1.0" encoding="utf-8"?>
+          <TextView xmlns:android="http://schemas.android.com/apk/res/android"
+              android:id="@+id/ttrow" android:layout_width="match_parent" android:layout_height="wrap_content"
+              android:textColor="#FFFFFF" android:textSize="13sp" android:singleLine="true" android:ellipsize="end"
+              android:paddingTop="1dp" android:paddingBottom="1dp"/>
           END_OF_FILE_X
 
           mkdir -p 'app/src/main/res/values'
@@ -1405,9 +2242,9 @@ jobs:
           mkdir -p 'app/src/main/res/xml'
           cat > 'app/src/main/res/xml/widget_info.xml' <<'END_OF_FILE_X'
           <appwidget-provider xmlns:android="http://schemas.android.com/apk/res/android"
-              android:minWidth="250dp" android:minHeight="200dp"
+              android:minWidth="250dp" android:minHeight="300dp"
               android:minResizeWidth="110dp" android:minResizeHeight="70dp"
-              android:targetCellWidth="4" android:targetCellHeight="4"
+              android:targetCellWidth="4" android:targetCellHeight="5"
               android:updatePeriodMillis="0"
               android:resizeMode="horizontal|vertical"
               android:widgetCategory="home_screen"
