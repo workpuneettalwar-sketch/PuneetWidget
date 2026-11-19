@@ -1032,8 +1032,6 @@ jobs:
                       Intent(this, ChartLaunch::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK), PendingIntent.FLAG_IMMUTABLE))
                   rv.setOnClickPendingIntent(R.id.stratbtn, PendingIntent.getActivity(this, 6,
                       Intent(this, ChartLaunch::class.java).putExtra("k", "stratlink").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK), PendingIntent.FLAG_IMMUTABLE))
-                  rv.setOnClickPendingIntent(R.id.gear, PendingIntent.getActivity(this, 3,
-                      Intent(this, SettingsActivity::class.java), PendingIntent.FLAG_IMMUTABLE))
                   AppWidgetManager.getInstance(this).updateAppWidget(ids(), rv)
                   com.btcwidget.tt.TtService.start(this)   // puts the Tradetron lines back after the full redraw
               }
@@ -1179,7 +1177,7 @@ jobs:
           import android.content.Context
           import android.content.Intent
 
-          enum class Level { BAD, WARN, LIVE, IDLE, DONE }
+          enum class Level { BAD, WARN, LIVE, IDLE, DONE, PAUSED }
 
           data class Row(val name: String, val status: String, val id: String) {
               val key: String get() = id.ifEmpty { name }
@@ -1190,7 +1188,8 @@ jobs:
 
               fun level(s: String): Level = when (norm(s)) {
                   "errorexecution", "error", "blocked" -> Level.BAD
-                  "exitpending", "awaitingoneclick", "livetranching", "paused" -> Level.WARN
+                  "exitpending", "awaitingoneclick", "livetranching" -> Level.WARN
+                  "paused" -> Level.PAUSED
                   "liveentered" -> Level.LIVE
                   "exited", "archived" -> Level.DONE
                   else -> Level.IDLE
@@ -1202,6 +1201,7 @@ jobs:
                   Level.LIVE -> 0xFF4CD964.toInt()
                   Level.IDLE -> 0xFFCFD8DC.toInt()
                   Level.DONE -> 0xFF78858C.toInt()
+                  Level.PAUSED -> 0xFF78858C.toInt()
               }
           }
 
@@ -1473,7 +1473,8 @@ jobs:
                       if (old != st) {
                           since[k] = now
                           prev[k] = st
-                          if (old != null) changes.add("${r.name.ifEmpty { r.id }}: ${r.status}")
+                          // paused / un-paused strategies never notify
+                          if (old != null && st != "paused" && old != "paused") changes.add("${r.name.ifEmpty { r.id }}: ${r.status}")
                       }
                       val dur = now - (since[k] ?: now)
                       val trigger = when {
@@ -1558,7 +1559,7 @@ jobs:
                   val rv = RemoteViews(packageName, R.layout.widget)
                   rv.setOnClickPendingIntent(R.id.tthead, openPi(1))
                   rv.setOnClickPendingIntent(R.id.ttgear, PendingIntent.getActivity(this, 3,
-                      Intent(this, TtSettingsActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK), PendingIntent.FLAG_IMMUTABLE))
+                      Intent(this, com.btcwidget.SettingsActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK), PendingIntent.FLAG_IMMUTABLE))
                   rv.setRemoteAdapter(R.id.ttlist, Intent(this, TtListService::class.java))
                   rv.setPendingIntentTemplate(R.id.ttlist, PendingIntent.getActivity(this, 8,
                       Intent(this, OpenActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
@@ -1576,7 +1577,7 @@ jobs:
                   val rv = RemoteViews(packageName, R.layout.widget)
                   val now = System.currentTimeMillis()
                   val ts = Prefs.tsize(this).toFloat()
-                  val order = listOf(Level.BAD, Level.WARN, Level.LIVE, Level.IDLE, Level.DONE)
+                  val order = listOf(Level.BAD, Level.WARN, Level.LIVE, Level.IDLE, Level.DONE, Level.PAUSED)
                   var rows = State.rows
                   if (Prefs.hideExited(this)) rows = rows.filter { Status.level(it.status) != Level.DONE }
                   rows = rows.sortedBy { order.indexOf(Status.level(it.status)) }
@@ -2147,8 +2148,6 @@ jobs:
                       <TextView android:id="@+id/nifty" android:layout_width="0dp" android:layout_height="wrap_content"
                           android:layout_weight="1" android:layout_marginStart="14dp" android:text="Nifty --"
                           android:textColor="#FFFFFF" android:textSize="20sp" android:textStyle="bold" android:singleLine="true"/>
-                      <ImageView android:id="@+id/gear" android:layout_width="24dp" android:layout_height="24dp"
-                          android:src="@android:drawable/ic_menu_preferences"/>
                   </LinearLayout>
                   <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
                       android:layout_marginTop="2dp" android:layout_marginBottom="2dp"
