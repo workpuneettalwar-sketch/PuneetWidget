@@ -1521,13 +1521,14 @@ jobs:
                   if (loud && Prefs.alarm(this)) playAlarm()
               }
 
-              /** Shrill high-pitched double beep, repeated for 20 s (or until the alert is tapped / dismissed). */
+              /** One shrill high-pitched double beep (not repeated: the error also shows on the widget). */
               private fun playAlarm() {
                   stopSound()
                   try {
                       tone = ToneGenerator(AudioManager.STREAM_ALARM, 100)
-                      beepUntil = System.currentTimeMillis() + 20_000
-                      h.post(beep)
+                      beepUntil = 0L
+                      tone?.startTone(ToneGenerator.TONE_CDMA_HIGH_SS, 700)
+                      h.postDelayed({ stopSound() }, 1200)
                   } catch (_: Exception) {}
               }
 
@@ -1800,7 +1801,7 @@ jobs:
 
                   label("Alerts", 16f)
                   switch("Alerts on errors / blocked / stuck / logged out", "alerts", true)
-                  switch("Loud double-beep alarm for those alerts (20 s)", "alarm", true)
+                  switch("Double beep (once) for those alerts", "alarm", true)
                   switch("Soft notification on every status change (entries / exits)", "changeBeep", false)
                   button("Test alert") { TtService.start(this, TtService.ACT_TEST) }
                   button("Allow running in background (battery)") { askBattery() }
