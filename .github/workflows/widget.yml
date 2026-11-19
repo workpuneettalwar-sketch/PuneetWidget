@@ -61,7 +61,7 @@ jobs:
                       <category android:name="android.intent.category.LAUNCHER"/>
                   </intent>
               </queries>
-              <application android:label="@string/app_name" android:theme="@android:style/Theme.Material.Light.DarkActionBar">
+              <application android:name=".App" android:label="@string/app_name" android:theme="@android:style/Theme.Material.Light.DarkActionBar">
                   <activity android:name=".SettingsActivity" android:exported="true">
                       <intent-filter>
                           <action android:name="android.intent.action.MAIN"/>
@@ -80,6 +80,12 @@ jobs:
                   <service android:name=".tt.TtService" android:exported="false" android:foregroundServiceType="specialUse">
                       <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE" android:value="live Tradetron status watch"/>
                   </service>
+                  <service android:name=".tt.TtService2" android:exported="false" android:process=":tt2"
+                      android:foregroundServiceType="specialUse">
+                      <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE" android:value="live Tradetron status watch (2nd account)"/>
+                  </service>
+                  <activity android:name=".tt.WebActivity2" android:exported="false" android:label="Tradetron - AT account"
+                      android:process=":tt2" android:configChanges="orientation|screenSize|keyboardHidden"/>
                   <service android:name=".tt.TtListService" android:exported="false"
                       android:permission="android.permission.BIND_REMOTEVIEWS"/>
                   <receiver android:name=".WidgetProvider" android:exported="true">
@@ -124,6 +130,25 @@ jobs:
                       }
                   }
                   return Triple(adx, pdi, mdi)
+              }
+          }
+          END_OF_FILE_X
+
+          mkdir -p 'app/src/main/java/com/btcwidget'
+          cat > 'app/src/main/java/com/btcwidget/App.kt' <<'END_OF_FILE_X'
+          package com.btcwidget
+
+          import android.app.Application
+          import android.os.Build
+          import android.webkit.WebView
+
+          /** Gives the ":tt2" process (AT Tradetron account) its own WebView storage, so its login never mixes with the main one. */
+          class App : Application() {
+              override fun onCreate() {
+                  super.onCreate()
+                  if (Build.VERSION.SDK_INT >= 28) {
+                      try { if (getProcessName().endsWith(":tt2")) WebView.setDataDirectorySuffix("tt2") } catch (_: Exception) {}
+                  }
               }
           }
           END_OF_FILE_X
@@ -1244,6 +1269,36 @@ jobs:
                   } catch (e: Exception) { "" }
               }
           }
+
+          /** The 2nd ("AT") Tradetron account: watched by TtService2 in its own process (own login), which saves its reading to a file. */
+          object Acct2 {
+              const val HDR = "__AT__"
+              class Snap(val rows: List<Row>, val lastOk: Long, val login: Boolean, val note: String)
+
+              fun enabled(c: Context) = Prefs.sp(c).getBoolean("acct2", false)
+              private fun file(c: Context) = java.io.File(c.filesDir, "tt2.json")
+
+              fun write(c: Context) {
+                  try {
+                      val o = org.json.JSONObject()
+                      o.put("lastOk", State.lastOk); o.put("login", State.login); o.put("note", State.note)
+                      val a = org.json.JSONArray()
+                      for (r in State.rows) a.put(org.json.JSONObject().put("n", r.name).put("s", r.status).put("id", r.id))
+                      o.put("rows", a)
+                      val tmp = java.io.File(c.filesDir, "tt2.tmp")
+                      tmp.writeText(o.toString())
+                      tmp.renameTo(file(c))
+                  } catch (_: Exception) {}
+              }
+
+              fun read(c: Context): Snap? = try {
+                  val o = org.json.JSONObject(file(c).readText())
+                  val a = o.optJSONArray("rows") ?: org.json.JSONArray()
+                  val rows = (0 until a.length()).mapNotNull { a.optJSONObject(it) }
+                      .map { Row(it.optString("n"), it.optString("s"), it.optString("id")) }
+                  Snap(rows, o.optLong("lastOk"), o.optBoolean("login"), o.optString("note"))
+              } catch (_: Exception) { null }
+          }
           END_OF_FILE_X
 
           mkdir -p 'app/src/main/java/com/btcwidget/tt'
@@ -1283,13 +1338,21 @@ jobs:
           import org.json.JSONArray
           import org.json.JSONObject
 
-          class TtService : Service() {
+          open class TtService : Service() {
               companion object {
                   fun start(c: Context, action: String? = null) {
                       try {
                           val i = Intent(c, TtService::class.java)
                           if (action != null) i.action = action
                           c.startForegroundService(i)
+                      } catch (_: Exception) {}
+                      // 2nd (AT) account runs in its own process with its own Tradetron login
+                      try {
+                          if (Acct2.enabled(c)) {
+                              val i = Intent(c, TtService2::class.java)
+                              if (action == ACT_RELOAD) i.action = action
+                              c.startForegroundService(i)
+                          } else c.stopService(Intent(c, TtService2::class.java))
                       } catch (_: Exception) {}
                   }
 
@@ -1321,6 +1384,13 @@ jobs:
               private var beepUntil = 0L
               private var startedAt = 0L
               private var lastSig = ""
+              /** true only in TtService2 (the AT account): reads Tradetron, saves to a file, no widget drawing, no alerts. */
+              protected open val acct2 = false
+              private val prev2 = HashMap<String, String>()
+              private val alerted2 = HashMap<String, String>()
+              private val since2 = HashMap<String, Long>()
+              private var at2LoginAlerted = false
+              private var at2StaleAlerted = false
 
               override fun onBind(i: Intent?): IBinder? = null
 
@@ -1334,10 +1404,12 @@ jobs:
                   ch.setBypassDnd(true)
                   ch.lockscreenVisibility = Notification.VISIBILITY_PUBLIC
                   nm.createNotificationChannel(ch)
-                  val n = Notification.Builder(this, "run").setContentTitle("Stock Widget watching Tradetron")
+                  val n = Notification.Builder(this, "run")
+                      .setContentTitle(if (acct2) "Stock Widget watching AT account" else "Stock Widget watching Tradetron")
                       .setSmallIcon(android.R.drawable.ic_dialog_info).build()
-                  if (Build.VERSION.SDK_INT >= 34) startForeground(7, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
-                  else startForeground(7, n)
+                  val nid = if (acct2) 8 else 7
+                  if (Build.VERSION.SDK_INT >= 34) startForeground(nid, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+                  else startForeground(nid, n)
                   probe = try { assets.open("probe.js").bufferedReader().use { it.readText() } } catch (e: Exception) { "" }
                   startedAt = System.currentTimeMillis()
               }
@@ -1352,7 +1424,7 @@ jobs:
                   when (i?.action) {
                       ACT_RELOAD -> { loginAlerted = false; loadDash() }
                       ACT_STOP_SOUND -> stopSound()
-                      ACT_TEST -> alert(3, "Tradetron test alert", "This is how a Tradetron error alert will look and sound.", true)
+                      ACT_TEST -> if (!acct2) alert(3, "Tradetron test alert", "This is how a Tradetron error alert will look and sound.", true)
                   }
                   initWidget()
                   render()
@@ -1418,7 +1490,7 @@ jobs:
                           if (v != null && v.contains("noinit")) { pending = false; if (probe.isNotEmpty()) wv?.evaluateJavascript(probe, null) }
                       }
                   }
-                  checkStale(now)
+                  if (!acct2) checkStale(now)
                   render()
               }
 
@@ -1429,7 +1501,7 @@ jobs:
                   if (o.optBoolean("login")) {
                       State.login = true
                       State.note = "Logged out - open the app and log in"
-                      if (!loginAlerted && Prefs.alerts(this)) {
+                      if (!acct2 && !loginAlerted && Prefs.alerts(this)) {
                           loginAlerted = true
                           alert(4, "Tradetron logged out", "Stock Widget can't see your strategies. Open the TT settings (gear on the TT line) and log in again.", true)
                       }
@@ -1456,7 +1528,7 @@ jobs:
                       State.rows = rows
                       State.lastOk = now
                       staleAlerted = false
-                      checkAlerts(rows, now)
+                      if (!acct2) checkAlerts(rows, now)
                   }
                   render()
               }
@@ -1491,6 +1563,41 @@ jobs:
                   if (!Prefs.alerts(this)) return
                   if (bad.isNotEmpty()) alert(2, "⚠ Tradetron: ${bad.size} need attention", bad.joinToString("\n"), true)
                   else if (changes.isNotEmpty() && Prefs.changeBeep(this)) alert(6, "Tradetron status changed", changes.joinToString("\n"), false)
+              }
+
+              /** AT account alerts: only for strategies that are NOT also deployed in the main account (those already alert once). */
+              private fun checkAlerts2(snap: Acct2.Snap, rows2: List<Row>, now: Long) {
+                  if (!Prefs.alerts(this)) return
+                  if (snap.login) {
+                      if (!at2LoginAlerted) { at2LoginAlerted = true; alert(10, "AT account logged out", "Open settings > Tradetron status > Log in to AT account.", true) }
+                      return
+                  }
+                  at2LoginAlerted = false
+                  if (snap.lastOk > 0 && now - snap.lastOk > 180_000) {
+                      if (!at2StaleAlerted) { at2StaleAlerted = true; alert(11, "AT account not updating", "No fresh status from the AT Tradetron account for 3 minutes.", true) }
+                  } else at2StaleAlerted = false
+                  val mainNames = State.rows.map { it.name.trim().lowercase() }.toSet()
+                  val bad = ArrayList<String>()
+                  for (r in snap.rows) {
+                      val k = r.key
+                      val st = Status.norm(r.status)
+                      if (prev2[k] != st) { since2[k] = now; prev2[k] = st }
+                      val dur = now - (since2[k] ?: now)
+                      val trigger = when {
+                          Status.level(r.status) == Level.BAD -> true
+                          st == "awaitingoneclick" -> true
+                          st == "exitpending" && dur > 30_000 -> true
+                          st == "livetranching" && dur > 60_000 -> true
+                          else -> false
+                      }
+                      if (trigger) {
+                          if (alerted2[k] != st) {
+                              alerted2[k] = st
+                              if (r.name.trim().lowercase() !in mainNames) bad.add("${r.name.ifEmpty { r.id }}: ${r.status}")
+                          }
+                      } else alerted2.remove(k)
+                  }
+                  if (bad.isNotEmpty()) alert(9, "⚠ AT account: ${bad.size} need attention", bad.joinToString("\n"), true)
               }
 
               private fun checkStale(now: Long) {
@@ -1556,6 +1663,7 @@ jobs:
 
               /** Only the Tradetron part of the Stock Widget (partial update, so prices / PnL are left alone). */
               private fun initWidget() {
+                  if (acct2) return
                   val rv = RemoteViews(packageName, R.layout.widget)
                   rv.setOnClickPendingIntent(R.id.tthead, openPi(1))
                   rv.setOnClickPendingIntent(R.id.ttgear, PendingIntent.getActivity(this, 3,
@@ -1573,14 +1681,19 @@ jobs:
                   return if (s < 60) "${s}s" else if (s < 3600) "${s / 60}m" else "${s / 3600}h"
               }
 
+              private fun sortRows(l: List<Row>): List<Row> {
+                  val order = listOf(Level.BAD, Level.WARN, Level.LIVE, Level.IDLE, Level.DONE, Level.PAUSED)
+                  var r = l
+                  if (Prefs.hideExited(this)) r = r.filter { Status.level(it.status) != Level.DONE }
+                  return r.sortedBy { order.indexOf(Status.level(it.status)) }
+              }
+
               private fun render() {
+                  if (acct2) { Acct2.write(this); return }
                   val rv = RemoteViews(packageName, R.layout.widget)
                   val now = System.currentTimeMillis()
                   val ts = Prefs.tsize(this).toFloat()
-                  val order = listOf(Level.BAD, Level.WARN, Level.LIVE, Level.IDLE, Level.DONE, Level.PAUSED)
-                  var rows = State.rows
-                  if (Prefs.hideExited(this)) rows = rows.filter { Status.level(it.status) != Level.DONE }
-                  rows = rows.sortedBy { order.indexOf(Status.level(it.status)) }
+                  var rows = sortRows(State.rows)
                   val nBad = rows.count { Status.level(it.status) == Level.BAD }
                   val nWarn = rows.count { Status.level(it.status) == Level.WARN }
                   val stale = State.lastOk > 0 && now - State.lastOk > 60_000
@@ -1592,8 +1705,30 @@ jobs:
                       nWarn > 0 -> "TT  ! $nWarn to check" to Status.color(Level.WARN)
                       else -> "TT  ✓ all OK" to Status.color(Level.LIVE)
                   }
-                  rv.setTextViewText(R.id.tthead, head)
-                  rv.setTextColor(R.id.tthead, col)
+                  // AT (2nd) account: header line + its strategies below the main ones (scroll down to see)
+                  var headTxt = head; var headCol = col
+                  if (Acct2.enabled(this)) {
+                      val snap = Acct2.read(this)
+                      val rows2 = sortRows(snap?.rows ?: emptyList())
+                      val bad2 = rows2.count { Status.level(it.status) == Level.BAD }
+                      val warn2 = rows2.count { Status.level(it.status) == Level.WARN }
+                      val stale2 = snap != null && snap.lastOk > 0 && now - snap.lastOk > 60_000
+                      val label = when {
+                          snap == null || (snap.lastOk == 0L && !snap.login) -> "connecting…"
+                          snap.login -> "LOGIN NEEDED"
+                          stale2 -> "NOT UPDATING"
+                          bad2 > 0 -> "⚠ $bad2 ERROR"
+                          warn2 > 0 -> "! $warn2 to check"
+                          else -> "✓ all OK"
+                      }
+                      rows = rows + Row("AT Account", label, Acct2.HDR) + rows2
+                      if (snap != null && (snap.login || stale2 || bad2 > 0)) {
+                          headTxt = "$head  · AT ⚠"; headCol = Status.color(Level.BAD)
+                      }
+                      if (snap != null) checkAlerts2(snap, rows2, now)
+                  }
+                  rv.setTextViewText(R.id.tthead, headTxt)
+                  rv.setTextColor(R.id.tthead, headCol)
                   rv.setTextViewTextSize(R.id.tthead, TypedValue.COMPLEX_UNIT_SP, ts + 2f)
                   rv.setTextViewText(R.id.ttupd, if (State.lastOk == 0L) "" else age(now - State.lastOk))
                   rv.setTextViewTextSize(R.id.ttupd, TypedValue.COMPLEX_UNIT_SP, ts - 2f)
@@ -1635,6 +1770,21 @@ jobs:
                   override fun getViewAt(p: Int): RemoteViews {
                       val rv = RemoteViews(packageName, R.layout.tt_row)
                       val r = rows.getOrNull(p) ?: return rv
+                      if (r.id == Acct2.HDR) {
+                          val c = when {
+                              r.status.startsWith("✓") -> Status.color(Level.LIVE)
+                              r.status.startsWith("!") -> Status.color(Level.WARN)
+                              r.status.startsWith("connecting") -> Status.color(Level.IDLE)
+                              else -> Status.color(Level.BAD)
+                          }
+                          val hb = SpannableStringBuilder("AT Account  " + r.status)
+                          hb.setSpan(ForegroundColorSpan(c), 0, hb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                          hb.setSpan(StyleSpan(Typeface.BOLD), 0, hb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                          rv.setTextViewText(R.id.ttrow, hb)
+                          rv.setTextViewTextSize(R.id.ttrow, TypedValue.COMPLEX_UNIT_SP, ts)
+                          rv.setOnClickFillInIntent(R.id.ttrow, Intent())
+                          return rv
+                      }
                       val lv = Status.level(r.status)
                       val sb = SpannableStringBuilder()
                       sb.append(r.status)
@@ -1652,6 +1802,11 @@ jobs:
                   override fun getItemId(p: Int) = p.toLong()
                   override fun hasStableIds() = false
               }
+          }
+
+          /** Same watcher for the 2nd (AT) Tradetron account, in its own process ":tt2" so it has its own login. */
+          class TtService2 : TtService() {
+              override val acct2 = true
           }
           END_OF_FILE_X
 
@@ -1684,7 +1839,7 @@ jobs:
           }
 
           /** Tradetron website inside the app: used to log in (the watcher shares this login) and as a full control panel. */
-          class WebActivity : Activity() {
+          open class WebActivity : Activity() {
               private lateinit var w: WebView
 
               @SuppressLint("SetJavaScriptEnabled")
@@ -1715,11 +1870,25 @@ jobs:
                   CookieManager.getInstance().flush()
               }
 
+              protected open fun reload() = TtService.start(this, TtService.ACT_RELOAD)
+
               override fun onDestroy() {
                   CookieManager.getInstance().flush()
-                  TtService.start(this, TtService.ACT_RELOAD)
+                  reload()
                   try { w.destroy() } catch (_: Exception) {}
                   super.onDestroy()
+              }
+          }
+
+          /** Tradetron website for the AT (2nd) account: runs in the ":tt2" process, so its login is kept apart. */
+          class WebActivity2 : WebActivity() {
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  title = "Tradetron - AT account"
+              }
+
+              override fun reload() {
+                  try { startForegroundService(Intent(this, TtService2::class.java).setAction(TtService.ACT_RELOAD)) } catch (_: Exception) {}
               }
           }
           END_OF_FILE_X
@@ -1794,6 +1963,11 @@ jobs:
                   }
                   button("Reload now") { TtService.start(this, TtService.ACT_RELOAD) }
 
+                  label("AT Account (2nd Tradetron account, e.g. the one in Secure Folder)", 16f)
+                  switch("Show AT account in the widget (scroll down the Tradetron list)", "acct2", false)
+                  button("Log in to AT account") { startActivity(Intent(this, WebActivity2::class.java).putExtra("url", Prefs.LOGIN)) }
+                  button("Open AT dashboard here") { startActivity(Intent(this, WebActivity2::class.java).putExtra("url", Prefs.DASH)) }
+
                   label("Check status every (seconds)")
                   interval = number("interval", 5)
                   label("Reload the dashboard page every (seconds) - used only while reading the page directly")
@@ -1836,6 +2010,15 @@ jobs:
                   s.append("\nStrategies read: ${State.rows.size}")
                   if (State.src.isNotEmpty()) s.append("   (source: ${State.src})")
                   if (State.note.isNotEmpty()) s.append("\nNote: ${State.note}")
+                  if (Acct2.enabled(this)) {
+                      val a = Acct2.read(this)
+                      s.append("\n\nAT account: ").append(when {
+                          a == null || (a.lastOk == 0L && !a.login) -> "⏳ connecting… (log in to AT account if this stays)"
+                          a.login -> "❌ logged out - tap Log in to AT account"
+                          now - a.lastOk > 60_000 -> "⚠ not updating (last ${(now - a.lastOk) / 1000}s ago)"
+                          else -> "✅ updated ${(now - a.lastOk) / 1000}s ago, ${a.rows.size} strategies"
+                      })
+                  }
                   status.text = s
               }
 
