@@ -996,9 +996,9 @@ jobs:
                       }
                       root.addView(btn)
                   }
-                  label("Widget buttons: 5 per row, 2 rows. Pick any installed app for each.")
+                  label("Widget buttons: 6 per row, 2 rows. Pick any installed app for each.")
                   Prefs.migrateSlots(this)
-                  Prefs.SLOT_KEYS.take(10).forEachIndexed { i, k -> pick(k, i + 1) }
+                  Prefs.SLOT_KEYS.forEachIndexed { i, k -> pick(k, i + 1) }
 
                   // ---------------- Secure Folder account (2nd Delta account) ----------------
                   root.addView(TextView(this).apply {
@@ -1073,8 +1073,18 @@ jobs:
               private val loop = Executors.newScheduledThreadPool(4)
               private var started = false
 
-              private val slotIds = listOf(R.id.btn1, R.id.btn2, R.id.btn3, R.id.btn4, R.id.btn5,
-                  R.id.btn6, R.id.btn7, R.id.btn8, R.id.btn9, R.id.btn10)
+              /** 4 rows x 6 icon places (btn1..btn24); the 12 apps are laid out in as many per row as the widget width allows. */
+              private fun place(n: Int) = resources.getIdentifier("btn$n", "id", packageName)
+              private fun rowId(r: Int) = resources.getIdentifier("row$r", "id", packageName)
+
+              /** How many app icons fit in one row at the widget's current width (max 6). */
+              private fun iconsPerRow(): Int {
+                  val m = AppWidgetManager.getInstance(this)
+                  val id = ids().firstOrNull() ?: return 6
+                  val w = m.getAppWidgetOptions(id).getInt(AppWidgetManager.OPTION_APPWIDGET_MIN_WIDTH, 0)
+                  if (w <= 0) return 6
+                  return ((w - 16) / 50).coerceIn(2, 6)
+              }
 
               override fun onBind(i: Intent?): IBinder? = null
 
@@ -1120,16 +1130,23 @@ jobs:
               private fun initWidget() {
                   val rv = RemoteViews(packageName, R.layout.widget)
                   Prefs.migrateSlots(this)
-                  val pkgs = Prefs.SLOT_KEYS.take(10).map { Prefs.str(this, it) }
-                  for (i in 0 until 10) {
+                  val pkgs = Prefs.SLOT_KEYS.map { Prefs.str(this, it) }
+                  val last = pkgs.indexOfLast { it.isNotEmpty() }      // trailing empty slots take no space
+                  val cols = iconsPerRow()
+                  for (n in 1..24) rv.setViewVisibility(place(n), View.GONE)
+                  val used = BooleanArray(5)
+                  for (i in 0..last) {
+                      val r = i / cols; val c = i % cols
+                      if (r > 3) break
+                      val v = place(r * 6 + c + 1)
+                      used[r + 1] = true
                       val pkg = pkgs[i]
-                      if (pkg.isEmpty()) { rv.setViewVisibility(slotIds[i], View.INVISIBLE); continue }
-                      rv.setViewVisibility(slotIds[i], View.VISIBLE)
-                      rv.setImageViewBitmap(slotIds[i], icon(pkg))
-                      open(10 + i, pkg)?.let { rv.setOnClickPendingIntent(slotIds[i], it) }
+                      if (pkg.isEmpty()) { rv.setViewVisibility(v, View.INVISIBLE); continue }
+                      rv.setViewVisibility(v, View.VISIBLE)
+                      rv.setImageViewBitmap(v, icon(pkg))
+                      open(10 + i, pkg)?.let { rv.setOnClickPendingIntent(v, it) }
                   }
-                  rv.setViewVisibility(R.id.row1, if (pkgs.subList(0, 5).any { it.isNotEmpty() }) View.VISIBLE else View.GONE)
-                  rv.setViewVisibility(R.id.row2, if (pkgs.subList(5, 10).any { it.isNotEmpty() }) View.VISIBLE else View.GONE)
+                  for (r in 1..4) rv.setViewVisibility(rowId(r), if (used[r]) View.VISIBLE else View.GONE)
                   rv.setOnClickPendingIntent(R.id.idxbtn, PendingIntent.getActivity(this, 4,
                       Intent(this, IndexActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK), PendingIntent.FLAG_IMMUTABLE))
                   rv.setOnClickPendingIntent(R.id.chartbtn, PendingIntent.getActivity(this, 5,
@@ -1261,6 +1278,8 @@ jobs:
           class WidgetProvider : AppWidgetProvider() {
               override fun onUpdate(c: Context, m: AppWidgetManager, ids: IntArray) = start(c)
               override fun onEnabled(c: Context) = start(c)
+              /** Widget resized: redraw so the app icons re-flow to the new width. */
+              override fun onAppWidgetOptionsChanged(c: Context, m: AppWidgetManager, id: Int, o: android.os.Bundle) = start(c)
 
               override fun onReceive(c: Context, i: Intent) {
                   super.onReceive(c, i)
@@ -1799,7 +1818,7 @@ jobs:
                       stale -> "PT  NOT UPDATING" to Status.color(Level.BAD)
                       nBad > 0 -> "PT  ⚠ $nBad ERROR" to Status.color(Level.BAD)
                       nWarn > 0 -> "PT  ! $nWarn to check" to Status.color(Level.WARN)
-                      else -> "PT  ✓ all OK" to Status.color(Level.LIVE)
+                      else -> "PT  ✓" to Status.color(Level.LIVE)
                   }
                   // AT (2nd) account: header line + its strategies below the main ones (scroll down to see)
                   var headTxt = head; var headCol = col
@@ -1815,7 +1834,7 @@ jobs:
                           stale2 -> "NOT UPDATING"
                           bad2 > 0 -> "⚠ $bad2 ERROR"
                           warn2 > 0 -> "! $warn2 to check"
-                          else -> "✓ all OK"
+                          else -> "✓"
                       }
                       rows = rows + Row("AT", label, Acct2.HDR) + rows2
                       if (snap != null && (snap.login || stale2 || bad2 > 0)) {
@@ -2396,6 +2415,15 @@ jobs:
           </shape>
           END_OF_FILE_X
 
+          mkdir -p 'app/src/main/res/drawable'
+          cat > 'app/src/main/res/drawable/purple_btn.xml' <<'END_OF_FILE_X'
+          <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+              <solid android:color="#7B3FBF"/>
+              <stroke android:width="1dp" android:color="#C9A2F2"/>
+              <corners android:radius="12dp"/>
+          </shape>
+          END_OF_FILE_X
+
           mkdir -p 'app/src/main/res/layout'
           cat > 'app/src/main/res/layout/widget.xml' <<'END_OF_FILE_X'
           <?xml version="1.0" encoding="utf-8"?>
@@ -2447,21 +2475,21 @@ jobs:
                           <FrameLayout android:layout_width="wrap_content" android:layout_height="0dp" android:layout_weight="1">
                               <TextView android:id="@+id/stratbtn" android:layout_width="66dp" android:layout_height="wrap_content"
                                   android:layout_gravity="center_vertical" android:gravity="center"
-                                  android:paddingTop="4dp" android:paddingBottom="4dp" android:background="@drawable/idx_btn"
+                                  android:paddingTop="4dp" android:paddingBottom="4dp" android:background="@drawable/purple_btn"
                                   android:text="TT" android:textColor="#FFFFFF" android:textSize="11sp" android:textStyle="bold"
                                   android:singleLine="true"/>
                           </FrameLayout>
                           <FrameLayout android:layout_width="wrap_content" android:layout_height="0dp" android:layout_weight="1">
                               <TextView android:id="@+id/chartbtn" android:layout_width="66dp" android:layout_height="wrap_content"
                                   android:layout_gravity="center_vertical" android:gravity="center"
-                                  android:paddingTop="4dp" android:paddingBottom="4dp" android:background="@drawable/idx_btn"
+                                  android:paddingTop="4dp" android:paddingBottom="4dp" android:background="@drawable/purple_btn"
                                   android:text="CHART" android:textColor="#FFFFFF" android:textSize="11sp" android:textStyle="bold"
                                   android:singleLine="true"/>
                           </FrameLayout>
                           <FrameLayout android:layout_width="wrap_content" android:layout_height="0dp" android:layout_weight="1">
                               <TextView android:id="@+id/idxbtn" android:layout_width="66dp" android:layout_height="wrap_content"
                                   android:layout_gravity="center_vertical" android:gravity="center"
-                                  android:paddingTop="4dp" android:paddingBottom="4dp" android:background="@drawable/idx_btn"
+                                  android:paddingTop="4dp" android:paddingBottom="4dp" android:background="@drawable/purple_btn"
                                   android:text="INDICES" android:textColor="#FFFFFF" android:textSize="11sp" android:textStyle="bold"
                                   android:singleLine="true"/>
                           </FrameLayout>
@@ -2534,11 +2562,11 @@ jobs:
                           android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
                       <ImageView android:id="@+id/btn5" android:layout_width="44dp" android:layout_height="match_parent"
                           android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
+                      <ImageView android:id="@+id/btn6" android:layout_width="44dp" android:layout_height="match_parent"
+                          android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
                   </LinearLayout>
                   <LinearLayout android:id="@+id/row2" android:layout_width="match_parent" android:layout_height="44dp"
                       android:layout_marginTop="3dp" android:orientation="horizontal" android:gravity="start|center_vertical">
-                      <ImageView android:id="@+id/btn6" android:layout_width="44dp" android:layout_height="match_parent"
-                          android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
                       <ImageView android:id="@+id/btn7" android:layout_width="44dp" android:layout_height="match_parent"
                           android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
                       <ImageView android:id="@+id/btn8" android:layout_width="44dp" android:layout_height="match_parent"
@@ -2546,6 +2574,40 @@ jobs:
                       <ImageView android:id="@+id/btn9" android:layout_width="44dp" android:layout_height="match_parent"
                           android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
                       <ImageView android:id="@+id/btn10" android:layout_width="44dp" android:layout_height="match_parent"
+                          android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
+                      <ImageView android:id="@+id/btn11" android:layout_width="44dp" android:layout_height="match_parent"
+                          android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
+                      <ImageView android:id="@+id/btn12" android:layout_width="44dp" android:layout_height="match_parent"
+                          android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
+                  </LinearLayout>
+                  <LinearLayout android:id="@+id/row3" android:layout_width="match_parent" android:layout_height="44dp"
+                      android:layout_marginTop="3dp" android:orientation="horizontal" android:gravity="start|center_vertical">
+                      <ImageView android:id="@+id/btn13" android:layout_width="44dp" android:layout_height="match_parent"
+                          android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
+                      <ImageView android:id="@+id/btn14" android:layout_width="44dp" android:layout_height="match_parent"
+                          android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
+                      <ImageView android:id="@+id/btn15" android:layout_width="44dp" android:layout_height="match_parent"
+                          android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
+                      <ImageView android:id="@+id/btn16" android:layout_width="44dp" android:layout_height="match_parent"
+                          android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
+                      <ImageView android:id="@+id/btn17" android:layout_width="44dp" android:layout_height="match_parent"
+                          android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
+                      <ImageView android:id="@+id/btn18" android:layout_width="44dp" android:layout_height="match_parent"
+                          android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
+                  </LinearLayout>
+                  <LinearLayout android:id="@+id/row4" android:layout_width="match_parent" android:layout_height="44dp"
+                      android:layout_marginTop="3dp" android:orientation="horizontal" android:gravity="start|center_vertical">
+                      <ImageView android:id="@+id/btn19" android:layout_width="44dp" android:layout_height="match_parent"
+                          android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
+                      <ImageView android:id="@+id/btn20" android:layout_width="44dp" android:layout_height="match_parent"
+                          android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
+                      <ImageView android:id="@+id/btn21" android:layout_width="44dp" android:layout_height="match_parent"
+                          android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
+                      <ImageView android:id="@+id/btn22" android:layout_width="44dp" android:layout_height="match_parent"
+                          android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
+                      <ImageView android:id="@+id/btn23" android:layout_width="44dp" android:layout_height="match_parent"
+                          android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
+                      <ImageView android:id="@+id/btn24" android:layout_width="44dp" android:layout_height="match_parent"
                           android:layout_marginLeft="3dp" android:layout_marginRight="3dp" android:padding="2dp" android:scaleType="fitCenter"/>
                   </LinearLayout>
               </LinearLayout>
