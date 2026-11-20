@@ -708,6 +708,8 @@ jobs:
               override fun onCreate(b: Bundle?) {
                   super.onCreate(b)
                   val k = intent.getStringExtra("k") ?: run { finish(); return }
+                  // Lock box not ticked: the button stays dead
+                  if (!Prefs.armed(this)) { finish(); return }
                   val name = names[k] ?: k
                   val link = Prefs.str(this, "link_$k")
                   if (link.isEmpty()) {
@@ -751,6 +753,9 @@ jobs:
 
           object Prefs {
               const val ACTION_CYCLE = "com.btcwidget.CYCLE"
+              const val ACTION_LOCK = "com.btcwidget.LOCK"
+              /** true when the Lock box is ticked = the 4 trade buttons are allowed to send. */
+              fun armed(c: Context) = sp(c).getBoolean("armed", false)
               val TFS = listOf("1m", "3m", "5m", "15m", "30m", "1h", "4h")
               val SLOT_KEYS = listOf("tvpkg", "dpkg", "tpkg") + (4..12).map { "app$it" }
 
@@ -1056,6 +1061,14 @@ jobs:
           import java.util.concurrent.TimeUnit
 
           class UpdateService : Service() {
+              companion object {
+                  /** Lock tick box: ticked (green) = trade buttons work; empty (grey) = buttons do nothing. */
+                  fun showLock(rv: RemoteViews, on: Boolean) {
+                      rv.setTextViewText(R.id.mlock, if (on) "☑ Lock" else "☐ Lock")
+                      rv.setTextColor(R.id.mlock, if (on) 0xFF4CD964.toInt() else 0xFFAAAAAA.toInt())
+                  }
+              }
+
               private val pool = Executors.newFixedThreadPool(16)
               private val loop = Executors.newScheduledThreadPool(4)
               private var started = false
@@ -1121,6 +1134,10 @@ jobs:
                       Intent(this, IndexActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK), PendingIntent.FLAG_IMMUTABLE))
                   rv.setOnClickPendingIntent(R.id.chartbtn, PendingIntent.getActivity(this, 5,
                       Intent(this, ChartLaunch::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK), PendingIntent.FLAG_IMMUTABLE))
+                  showLock(rv, Prefs.armed(this))
+                  rv.setOnClickPendingIntent(R.id.mlock, PendingIntent.getBroadcast(this, 30,
+                      Intent(this, WidgetProvider::class.java).setAction(Prefs.ACTION_LOCK),
+                      PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT))
                   for ((i, pair) in listOf(R.id.mle to "le", R.id.mlx to "lx", R.id.mse to "se", R.id.msx to "sx").withIndex()) {
                       rv.setOnClickPendingIntent(pair.first, PendingIntent.getActivity(this, 20 + i,
                           Intent(this, ManualActivity::class.java).putExtra("k", pair.second).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
@@ -1247,6 +1264,14 @@ jobs:
 
               override fun onReceive(c: Context, i: Intent) {
                   super.onReceive(c, i)
+                  if (i.action == Prefs.ACTION_LOCK) {
+                      val on = !Prefs.armed(c)
+                      Prefs.sp(c).edit().putBoolean("armed", on).apply()
+                      val m = AppWidgetManager.getInstance(c)
+                      val rv = android.widget.RemoteViews(c.packageName, R.layout.widget)
+                      UpdateService.showLock(rv, on)
+                      m.partiallyUpdateAppWidget(m.getAppWidgetIds(android.content.ComponentName(c, WidgetProvider::class.java)), rv)
+                  }
                   if (i.action == Prefs.ACTION_CYCLE) {
                       val next = Prefs.TFS[(Prefs.TFS.indexOf(Prefs.tf(c)) + 1) % Prefs.TFS.size]
                       Prefs.sp(c).edit().putString("tf", next).apply()
@@ -1792,7 +1817,7 @@ jobs:
                           warn2 > 0 -> "! $warn2 to check"
                           else -> "✓ all OK"
                       }
-                      rows = rows + Row("AT Account", label, Acct2.HDR) + rows2
+                      rows = rows + Row("AT", label, Acct2.HDR) + rows2
                       if (snap != null && (snap.login || stale2 || bad2 > 0)) {
                           headTxt = "$head  · AT ⚠"; headCol = Status.color(Level.BAD)
                       }
@@ -1842,7 +1867,7 @@ jobs:
                               r.status.startsWith("connecting") -> Status.color(Level.IDLE)
                               else -> Status.color(Level.BAD)
                           }
-                          val hb = SpannableStringBuilder("AT Account  " + r.status)
+                          val hb = SpannableStringBuilder("AT  " + r.status)
                           hb.setSpan(ForegroundColorSpan(c), 0, hb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
                           hb.setSpan(StyleSpan(Typeface.BOLD), 0, hb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
                           rv.setTextViewText(R.id.ttrow, hb)
@@ -2380,52 +2405,48 @@ jobs:
                   android:scaleType="fitXY" android:src="@drawable/bg"/>
               <LinearLayout android:layout_width="match_parent" android:layout_height="match_parent"
                   android:orientation="vertical" android:padding="8dp">
-                  <!-- top part: grows when the widget is made taller -->
+                  <!-- Lock tick box: trade buttons work only while it is ticked -->
+                  <TextView android:id="@+id/mlock" android:layout_width="wrap_content" android:layout_height="wrap_content"
+                      android:paddingTop="2dp" android:paddingBottom="2dp" android:paddingEnd="12dp"
+                      android:text="☐ Lock" android:textColor="#FFFFFF" android:textSize="14sp" android:textStyle="bold"/>
+                  <LinearLayout android:layout_width="wrap_content" android:layout_height="wrap_content"
+                      android:orientation="horizontal" android:layout_marginTop="2dp" android:layout_marginBottom="6dp">
+                      <TextView android:id="@+id/mle" android:layout_width="58dp" android:layout_height="wrap_content"
+                          android:layout_marginEnd="6dp" android:gravity="center" android:paddingTop="4dp" android:paddingBottom="4dp"
+                          android:background="@drawable/idx_btn" android:text="ENTER" android:textColor="#FFFFFF"
+                          android:textSize="11sp" android:textStyle="bold" android:singleLine="true"/>
+                      <TextView android:id="@+id/mlx" android:layout_width="58dp" android:layout_height="wrap_content"
+                          android:layout_marginEnd="6dp" android:gravity="center" android:paddingTop="4dp" android:paddingBottom="4dp"
+                          android:background="@drawable/idx_btn" android:text="EXIT" android:textColor="#FFFFFF"
+                          android:textSize="11sp" android:textStyle="bold" android:singleLine="true"/>
+                      <TextView android:id="@+id/mse" android:layout_width="58dp" android:layout_height="wrap_content"
+                          android:layout_marginEnd="6dp" android:gravity="center" android:paddingTop="4dp" android:paddingBottom="4dp"
+                          android:background="@drawable/red_btn" android:text="ENTER" android:textColor="#FFFFFF"
+                          android:textSize="11sp" android:textStyle="bold" android:singleLine="true"/>
+                      <TextView android:id="@+id/msx" android:layout_width="58dp" android:layout_height="wrap_content"
+                          android:gravity="center" android:paddingTop="4dp" android:paddingBottom="4dp"
+                          android:background="@drawable/red_btn" android:text="EXIT" android:textColor="#FFFFFF"
+                          android:textSize="11sp" android:textStyle="bold" android:singleLine="true"/>
+                  </LinearLayout>
+                  <!-- Tradetron part: grows when the widget is made taller -->
                   <LinearLayout android:layout_width="match_parent" android:layout_height="0dp" android:layout_weight="1"
-                      android:orientation="horizontal">
-                      <LinearLayout android:layout_width="wrap_content" android:layout_height="wrap_content"
-                          android:orientation="vertical" android:layout_marginEnd="10dp" android:layout_marginTop="2dp">
-                          <LinearLayout android:layout_width="wrap_content" android:layout_height="wrap_content" android:orientation="horizontal">
-                              <TextView android:id="@+id/mle" android:layout_width="58dp" android:layout_height="wrap_content"
-                                  android:layout_marginEnd="6dp" android:gravity="center" android:paddingTop="4dp" android:paddingBottom="4dp"
-                                  android:background="@drawable/idx_btn" android:text="ENTER" android:textColor="#FFFFFF"
-                                  android:textSize="11sp" android:textStyle="bold" android:singleLine="true"/>
-                              <TextView android:id="@+id/mlx" android:layout_width="58dp" android:layout_height="wrap_content"
-                                  android:gravity="center" android:paddingTop="4dp" android:paddingBottom="4dp"
-                                  android:background="@drawable/idx_btn" android:text="EXIT" android:textColor="#FFFFFF"
-                                  android:textSize="11sp" android:textStyle="bold" android:singleLine="true"/>
-                          </LinearLayout>
-                          <LinearLayout android:layout_width="wrap_content" android:layout_height="wrap_content"
-                              android:orientation="horizontal" android:layout_marginTop="8dp">
-                              <TextView android:id="@+id/mse" android:layout_width="58dp" android:layout_height="wrap_content"
-                                  android:layout_marginEnd="6dp" android:gravity="center" android:paddingTop="4dp" android:paddingBottom="4dp"
-                                  android:background="@drawable/red_btn" android:text="ENTER" android:textColor="#FFFFFF"
-                                  android:textSize="11sp" android:textStyle="bold" android:singleLine="true"/>
-                              <TextView android:id="@+id/msx" android:layout_width="58dp" android:layout_height="wrap_content"
-                                  android:gravity="center" android:paddingTop="4dp" android:paddingBottom="4dp"
-                                  android:background="@drawable/red_btn" android:text="EXIT" android:textColor="#FFFFFF"
-                                  android:textSize="11sp" android:textStyle="bold" android:singleLine="true"/>
-                          </LinearLayout>
-                      </LinearLayout>
-                      <LinearLayout android:layout_width="0dp" android:layout_weight="1" android:layout_height="match_parent"
-                          android:orientation="vertical">
-                      <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
-                          android:orientation="horizontal" android:gravity="center_vertical">
-                          <TextView android:id="@+id/tthead" android:layout_width="0dp" android:layout_weight="1"
-                              android:layout_height="wrap_content" android:text="TT  starting…" android:textColor="#FFFFFF"
-                              android:textSize="15sp" android:textStyle="bold" android:singleLine="true" android:ellipsize="end"/>
-                          <TextView android:id="@+id/ttupd" android:layout_width="wrap_content" android:layout_height="wrap_content"
-                              android:textColor="#AAAAAA" android:textSize="11sp" android:layout_marginEnd="8dp"/>
-                          <ImageView android:id="@+id/ttgear" android:layout_width="24dp" android:layout_height="24dp"
-                              android:src="@android:drawable/ic_menu_manage" android:alpha="0.8"/>
-                      </LinearLayout>
-                      <TextView android:id="@+id/ttempty" android:layout_width="match_parent" android:layout_height="wrap_content"
-                          android:text="No running strategies" android:textColor="#AAAAAA" android:textSize="12sp"
-                          android:visibility="gone" android:paddingTop="2dp"/>
-                      <ListView android:id="@+id/ttlist" android:layout_width="match_parent" android:layout_height="0dp" android:layout_weight="1"
-                          android:divider="@null" android:dividerHeight="0dp" android:scrollbars="vertical"
-                          android:listSelector="@android:color/transparent" android:visibility="gone"/>
-                      </LinearLayout>
+                      android:orientation="vertical">
+                  <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+                      android:orientation="horizontal" android:gravity="center_vertical">
+                      <TextView android:id="@+id/tthead" android:layout_width="0dp" android:layout_weight="1"
+                          android:layout_height="wrap_content" android:text="TT  starting…" android:textColor="#FFFFFF"
+                          android:textSize="15sp" android:textStyle="bold" android:singleLine="true" android:ellipsize="end"/>
+                      <TextView android:id="@+id/ttupd" android:layout_width="wrap_content" android:layout_height="wrap_content"
+                          android:textColor="#AAAAAA" android:textSize="11sp" android:layout_marginEnd="8dp"/>
+                      <ImageView android:id="@+id/ttgear" android:layout_width="24dp" android:layout_height="24dp"
+                          android:src="@android:drawable/ic_menu_manage" android:alpha="0.8"/>
+                  </LinearLayout>
+                  <TextView android:id="@+id/ttempty" android:layout_width="match_parent" android:layout_height="wrap_content"
+                      android:text="No running strategies" android:textColor="#AAAAAA" android:textSize="12sp"
+                      android:visibility="gone" android:paddingTop="2dp"/>
+                  <ListView android:id="@+id/ttlist" android:layout_width="match_parent" android:layout_height="0dp" android:layout_weight="1"
+                      android:divider="@null" android:dividerHeight="0dp" android:scrollbars="vertical"
+                      android:listSelector="@android:color/transparent" android:visibility="gone"/>
                   </LinearLayout>
                   <FrameLayout android:layout_width="match_parent" android:layout_height="8dp"/>
                   <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
