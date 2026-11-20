@@ -850,7 +850,11 @@ jobs:
                   } else {
                       if (!link.contains("://")) link = "https://$link"
                       try {
-                          startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse(link)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                          // Same "application id" every time for this button: Chrome then reuses the tab it opened
+                          // last time for this button instead of opening a new tab (CHART and TT each keep their own tab).
+                          startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse(link))
+                              .putExtra(android.provider.Browser.EXTRA_APPLICATION_ID, "$packageName.$key")
+                              .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
                       } catch (e: Exception) {
                           Toast.makeText(applicationContext, "Could not open link: " + (e.message ?: e.javaClass.simpleName), Toast.LENGTH_LONG).show()
                       }
