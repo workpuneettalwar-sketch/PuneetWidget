@@ -88,6 +88,8 @@ jobs:
                       android:process=":tt2" android:configChanges="orientation|screenSize|keyboardHidden"/>
                   <service android:name=".tt.TtListService" android:exported="false"
                       android:permission="android.permission.BIND_REMOTEVIEWS"/>
+                  <activity android:name=".ManualActivity" android:exported="false" android:excludeFromRecents="true"
+                      android:taskAffinity="" android:theme="@android:style/Theme.Translucent.NoTitleBar"/>
                   <receiver android:name=".WidgetProvider" android:exported="true">
                       <intent-filter><action android:name="android.appwidget.action.APPWIDGET_UPDATE"/></intent-filter>
                       <meta-data android:name="android.appwidget.provider" android:resource="@xml/widget_info"/>
@@ -688,6 +690,60 @@ jobs:
           END_OF_FILE_X
 
           mkdir -p 'app/src/main/java/com/btcwidget'
+          cat > 'app/src/main/java/com/btcwidget/ManualActivity.kt' <<'END_OF_FILE_X'
+          package com.btcwidget
+
+          import android.app.Activity
+          import android.app.AlertDialog
+          import android.content.Intent
+          import android.os.Bundle
+          import android.widget.Toast
+          import java.net.HttpURLConnection
+          import java.net.URL
+
+          /** Behind the 4 manual buttons: sends the saved Tradetron API link for that button (after an optional confirm). */
+          class ManualActivity : Activity() {
+              private val names = mapOf("le" to "LONG ENTER", "lx" to "LONG EXIT", "se" to "SHORT ENTER", "sx" to "SHORT EXIT")
+
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  val k = intent.getStringExtra("k") ?: run { finish(); return }
+                  val name = names[k] ?: k
+                  val link = Prefs.str(this, "link_$k")
+                  if (link.isEmpty()) {
+                      Toast.makeText(applicationContext, "Add the $name link in widget settings", Toast.LENGTH_LONG).show()
+                      startActivity(Intent(this, SettingsActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                      finish(); return
+                  }
+                  if (!Prefs.sp(this).getBoolean("mconfirm", true)) { send(name, link); finish(); return }
+                  AlertDialog.Builder(this)
+                      .setTitle("Send $name?")
+                      .setMessage("This sends the $name command to Tradetron now.")
+                      .setPositiveButton("SEND") { _, _ -> send(name, link) }
+                      .setNegativeButton("Cancel", null)
+                      .setOnDismissListener { finish() }
+                      .show()
+              }
+
+              private fun send(name: String, link: String) {
+                  val app = applicationContext
+                  Toast.makeText(app, "Sending $name…", Toast.LENGTH_SHORT).show()
+                  Thread {
+                      val msg = try {
+                          val c = URL(if (link.contains("://")) link else "https://$link").openConnection() as HttpURLConnection
+                          c.connectTimeout = 10000; c.readTimeout = 15000
+                          val code = c.responseCode
+                          val body = try { (if (code < 400) c.inputStream else c.errorStream)?.bufferedReader()?.use { it.readText() } ?: "" } catch (_: Exception) { "" }
+                          c.disconnect()
+                          if (code in 200..299) "$name sent ✓ " + body.take(80) else "$name FAILED (HTTP $code) " + body.take(80)
+                      } catch (e: Exception) { "$name FAILED: " + (e.message ?: e.javaClass.simpleName) }
+                      android.os.Handler(android.os.Looper.getMainLooper()).post { Toast.makeText(app, msg, Toast.LENGTH_LONG).show() }
+                  }.start()
+              }
+          }
+          END_OF_FILE_X
+
+          mkdir -p 'app/src/main/java/com/btcwidget'
           cat > 'app/src/main/java/com/btcwidget/Prefs.kt' <<'END_OF_FILE_X'
           package com.btcwidget
 
@@ -852,6 +908,16 @@ jobs:
                   field("rtoken", "Relay token")
                   field("key", "Delta API key (read-only; optional backup if relay is down)")
                   field("secret", "Delta API secret (optional backup)")
+                  label("MANUAL TRADE BUTTONS (top-left of the widget). Paste each Tradetron API link:")
+                  field("link_le", "Green ENTER = Long strategy entry link")
+                  field("link_lx", "Green EXIT = Long strategy exit link")
+                  field("link_se", "Red ENTER = Short strategy entry link")
+                  field("link_sx", "Red EXIT = Short strategy exit link")
+                  root.addView(CheckBox(this).apply {
+                      text = "Ask \"Are you sure?\" before sending (protects against accidental taps)"
+                      isChecked = sp.getBoolean("mconfirm", true)
+                      setOnCheckedChangeListener { _, v -> sp.edit().putBoolean("mconfirm", v).apply() }
+                  })
                   field("stratlink", "STRATEGIES button link: paste the link to open (e.g. your Tradetron deployed strategies page)")
                   field("chartlink", "CHART button link: paste the link of the chart you want (e.g. a TradingView or Delta chart link)")
                   field("pnlsrc", "PnL source: blank = widget calculation (recommended). Type delta to use Delta's own field (known to be wrong for options)")
@@ -1055,6 +1121,11 @@ jobs:
                       Intent(this, IndexActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK), PendingIntent.FLAG_IMMUTABLE))
                   rv.setOnClickPendingIntent(R.id.chartbtn, PendingIntent.getActivity(this, 5,
                       Intent(this, ChartLaunch::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK), PendingIntent.FLAG_IMMUTABLE))
+                  for ((i, pair) in listOf(R.id.mle to "le", R.id.mlx to "lx", R.id.mse to "se", R.id.msx to "sx").withIndex()) {
+                      rv.setOnClickPendingIntent(pair.first, PendingIntent.getActivity(this, 20 + i,
+                          Intent(this, ManualActivity::class.java).putExtra("k", pair.second).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                          PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT))
+                  }
                   rv.setOnClickPendingIntent(R.id.stratbtn, PendingIntent.getActivity(this, 6,
                       Intent(this, ChartLaunch::class.java).putExtra("k", "stratlink").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK), PendingIntent.FLAG_IMMUTABLE))
                   AppWidgetManager.getInstance(this).updateAppWidget(ids(), rv)
@@ -1732,15 +1803,9 @@ jobs:
                   rv.setTextViewTextSize(R.id.tthead, TypedValue.COMPLEX_UNIT_SP, ts + 2f)
                   rv.setTextViewText(R.id.ttupd, if (State.lastOk == 0L) "" else age(now - State.lastOk))
                   rv.setTextViewTextSize(R.id.ttupd, TypedValue.COMPLEX_UNIT_SP, ts - 2f)
-                  // list: 5 rows visible, the rest by scrolling
+                  // list fills all the space the widget gives it (taller widget = more rows); the rest by scrolling
                   shown = rows; shownTs = ts
-                  val vis = minOf(rows.size, 5)
-                  val rowDp = ts * 1.32f + 2f
-                  if (vis == 0) rv.setViewVisibility(R.id.ttlist, View.GONE)
-                  else {
-                      rv.setViewVisibility(R.id.ttlist, View.VISIBLE)
-                      if (Build.VERSION.SDK_INT >= 31) rv.setViewLayoutHeight(R.id.ttlist, vis * rowDp, TypedValue.COMPLEX_UNIT_DIP)
-                  }
+                  rv.setViewVisibility(R.id.ttlist, if (rows.isEmpty()) View.GONE else View.VISIBLE)
                   rv.setViewVisibility(R.id.ttempty, if (rows.isEmpty() && State.lastOk > 0) View.VISIBLE else View.GONE)
                   val sig = ts.toString() + "|" + rows.joinToString("|") { it.status + "~" + it.name + "~" + it.id }
                   if (sig != lastSig) {
@@ -2297,6 +2362,15 @@ jobs:
           </shape>
           END_OF_FILE_X
 
+          mkdir -p 'app/src/main/res/drawable'
+          cat > 'app/src/main/res/drawable/red_btn.xml' <<'END_OF_FILE_X'
+          <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+              <solid android:color="#C62828"/>
+              <stroke android:width="1dp" android:color="#FF8A80"/>
+              <corners android:radius="12dp"/>
+          </shape>
+          END_OF_FILE_X
+
           mkdir -p 'app/src/main/res/layout'
           cat > 'app/src/main/res/layout/widget.xml' <<'END_OF_FILE_X'
           <?xml version="1.0" encoding="utf-8"?>
@@ -2306,22 +2380,53 @@ jobs:
                   android:scaleType="fitXY" android:src="@drawable/bg"/>
               <LinearLayout android:layout_width="match_parent" android:layout_height="match_parent"
                   android:orientation="vertical" android:padding="8dp">
-                  <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
-                      android:orientation="horizontal" android:gravity="center_vertical">
-                      <TextView android:id="@+id/tthead" android:layout_width="0dp" android:layout_weight="1"
-                          android:layout_height="wrap_content" android:text="TT  starting…" android:textColor="#FFFFFF"
-                          android:textSize="15sp" android:textStyle="bold" android:singleLine="true" android:ellipsize="end"/>
-                      <TextView android:id="@+id/ttupd" android:layout_width="wrap_content" android:layout_height="wrap_content"
-                          android:textColor="#AAAAAA" android:textSize="11sp" android:layout_marginEnd="8dp"/>
-                      <ImageView android:id="@+id/ttgear" android:layout_width="24dp" android:layout_height="24dp"
-                          android:src="@android:drawable/ic_menu_manage" android:alpha="0.8"/>
+                  <!-- top part: grows when the widget is made taller -->
+                  <LinearLayout android:layout_width="match_parent" android:layout_height="0dp" android:layout_weight="1"
+                      android:orientation="horizontal">
+                      <LinearLayout android:layout_width="wrap_content" android:layout_height="wrap_content"
+                          android:orientation="vertical" android:layout_marginEnd="10dp" android:layout_marginTop="2dp">
+                          <LinearLayout android:layout_width="wrap_content" android:layout_height="wrap_content" android:orientation="horizontal">
+                              <TextView android:id="@+id/mle" android:layout_width="58dp" android:layout_height="wrap_content"
+                                  android:layout_marginEnd="6dp" android:gravity="center" android:paddingTop="4dp" android:paddingBottom="4dp"
+                                  android:background="@drawable/idx_btn" android:text="ENTER" android:textColor="#FFFFFF"
+                                  android:textSize="11sp" android:textStyle="bold" android:singleLine="true"/>
+                              <TextView android:id="@+id/mlx" android:layout_width="58dp" android:layout_height="wrap_content"
+                                  android:gravity="center" android:paddingTop="4dp" android:paddingBottom="4dp"
+                                  android:background="@drawable/idx_btn" android:text="EXIT" android:textColor="#FFFFFF"
+                                  android:textSize="11sp" android:textStyle="bold" android:singleLine="true"/>
+                          </LinearLayout>
+                          <LinearLayout android:layout_width="wrap_content" android:layout_height="wrap_content"
+                              android:orientation="horizontal" android:layout_marginTop="8dp">
+                              <TextView android:id="@+id/mse" android:layout_width="58dp" android:layout_height="wrap_content"
+                                  android:layout_marginEnd="6dp" android:gravity="center" android:paddingTop="4dp" android:paddingBottom="4dp"
+                                  android:background="@drawable/red_btn" android:text="ENTER" android:textColor="#FFFFFF"
+                                  android:textSize="11sp" android:textStyle="bold" android:singleLine="true"/>
+                              <TextView android:id="@+id/msx" android:layout_width="58dp" android:layout_height="wrap_content"
+                                  android:gravity="center" android:paddingTop="4dp" android:paddingBottom="4dp"
+                                  android:background="@drawable/red_btn" android:text="EXIT" android:textColor="#FFFFFF"
+                                  android:textSize="11sp" android:textStyle="bold" android:singleLine="true"/>
+                          </LinearLayout>
+                      </LinearLayout>
+                      <LinearLayout android:layout_width="0dp" android:layout_weight="1" android:layout_height="match_parent"
+                          android:orientation="vertical">
+                      <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+                          android:orientation="horizontal" android:gravity="center_vertical">
+                          <TextView android:id="@+id/tthead" android:layout_width="0dp" android:layout_weight="1"
+                              android:layout_height="wrap_content" android:text="TT  starting…" android:textColor="#FFFFFF"
+                              android:textSize="15sp" android:textStyle="bold" android:singleLine="true" android:ellipsize="end"/>
+                          <TextView android:id="@+id/ttupd" android:layout_width="wrap_content" android:layout_height="wrap_content"
+                              android:textColor="#AAAAAA" android:textSize="11sp" android:layout_marginEnd="8dp"/>
+                          <ImageView android:id="@+id/ttgear" android:layout_width="24dp" android:layout_height="24dp"
+                              android:src="@android:drawable/ic_menu_manage" android:alpha="0.8"/>
+                      </LinearLayout>
+                      <TextView android:id="@+id/ttempty" android:layout_width="match_parent" android:layout_height="wrap_content"
+                          android:text="No running strategies" android:textColor="#AAAAAA" android:textSize="12sp"
+                          android:visibility="gone" android:paddingTop="2dp"/>
+                      <ListView android:id="@+id/ttlist" android:layout_width="match_parent" android:layout_height="0dp" android:layout_weight="1"
+                          android:divider="@null" android:dividerHeight="0dp" android:scrollbars="vertical"
+                          android:listSelector="@android:color/transparent" android:visibility="gone"/>
+                      </LinearLayout>
                   </LinearLayout>
-                  <TextView android:id="@+id/ttempty" android:layout_width="match_parent" android:layout_height="wrap_content"
-                      android:text="No running strategies" android:textColor="#AAAAAA" android:textSize="12sp"
-                      android:visibility="gone" android:paddingTop="2dp"/>
-                  <ListView android:id="@+id/ttlist" android:layout_width="match_parent" android:layout_height="90dp"
-                      android:divider="@null" android:dividerHeight="0dp" android:scrollbars="vertical"
-                      android:listSelector="@android:color/transparent" android:visibility="gone"/>
                   <FrameLayout android:layout_width="match_parent" android:layout_height="8dp"/>
                   <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
                       android:orientation="horizontal" android:gravity="center_vertical">
