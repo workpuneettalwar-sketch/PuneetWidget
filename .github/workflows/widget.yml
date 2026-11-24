@@ -701,9 +701,11 @@ jobs:
           import java.net.HttpURLConnection
           import java.net.URL
 
-          /** Behind the 4 manual buttons: sends the saved Tradetron API link for that button (after an optional confirm). */
+          /** Behind the 12 manual buttons: sends the saved Tradetron API link for that button (after an optional confirm). */
           class ManualActivity : Activity() {
-              private val names = mapOf("le" to "LONG ENTER", "lx" to "LONG EXIT", "se" to "SHORT ENTER", "sx" to "SHORT EXIT")
+              private val names = mapOf("le" to "LONG ENTER", "lx" to "LONG EXIT", "se" to "SHORT ENTER", "sx" to "SHORT EXIT",
+                  "ue" to "BULL ENTER", "ux" to "BULL EXIT", "de" to "BEAR ENTER", "dx" to "BEAR EXIT",
+                  "u4e" to "BULL 4H ENTER", "u4x" to "BULL 4H EXIT", "d4e" to "BEAR 4H ENTER", "d4x" to "BEAR 4H EXIT")
 
               override fun onCreate(b: Bundle?) {
                   super.onCreate(b)
@@ -917,11 +919,19 @@ jobs:
                   field("rtoken", "Relay token")
                   field("key", "Delta API key (read-only; optional backup if relay is down)")
                   field("secret", "Delta API secret (optional backup)")
-                  label("MANUAL TRADE BUTTONS (top-left of the widget). Paste each Tradetron API link:")
-                  field("link_le", "Green ENTER = Long strategy entry link")
-                  field("link_lx", "Green EXIT = Long strategy exit link")
-                  field("link_se", "Red ENTER = Short strategy entry link")
-                  field("link_sx", "Red EXIT = Short strategy exit link")
+                  label("MANUAL TRADE BUTTONS (left side of the widget). Paste each Tradetron API link:")
+                  field("link_le", "Long: Enter link")
+                  field("link_lx", "Long: Exit link")
+                  field("link_se", "Short: Enter link")
+                  field("link_sx", "Short: Exit link")
+                  field("link_ue", "Bull: Enter link")
+                  field("link_ux", "Bull: Exit link")
+                  field("link_de", "Bear: Enter link")
+                  field("link_dx", "Bear: Exit link")
+                  field("link_u4e", "Bull 4H: Enter link")
+                  field("link_u4x", "Bull 4H: Exit link")
+                  field("link_d4e", "Bear 4H: Enter link")
+                  field("link_d4x", "Bear 4H: Exit link")
                   root.addView(CheckBox(this).apply {
                       text = "Ask \"Are you sure?\" before sending (protects against accidental taps)"
                       isChecked = sp.getBoolean("mconfirm", true)
@@ -1159,8 +1169,10 @@ jobs:
                   rv.setOnClickPendingIntent(R.id.mlock, PendingIntent.getBroadcast(this, 30,
                       Intent(this, WidgetProvider::class.java).setAction(Prefs.ACTION_LOCK),
                       PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT))
-                  for ((i, pair) in listOf(R.id.mle to "le", R.id.mlx to "lx", R.id.mse to "se", R.id.msx to "sx").withIndex()) {
-                      rv.setOnClickPendingIntent(pair.first, PendingIntent.getActivity(this, 20 + i,
+                  for ((i, pair) in listOf(R.id.mle to "le", R.id.mlx to "lx", R.id.mse to "se", R.id.msx to "sx",
+                          R.id.mue to "ue", R.id.mux to "ux", R.id.mde to "de", R.id.mdx to "dx",
+                          R.id.mu4e to "u4e", R.id.mu4x to "u4x", R.id.md4e to "d4e", R.id.md4x to "d4x").withIndex()) {
+                      rv.setOnClickPendingIntent(pair.first, PendingIntent.getActivity(this, 40 + i,
                           Intent(this, ManualActivity::class.java).putExtra("k", pair.second).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
                           PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT))
                   }
@@ -2439,7 +2451,7 @@ jobs:
                   android:orientation="vertical" android:padding="8dp">
                   <LinearLayout android:layout_width="match_parent" android:layout_height="0dp" android:layout_weight="1"
                       android:orientation="horizontal">
-                      <!-- left: Lock + 7 buttons, spread evenly from top down to the app icons -->
+                      <!-- left: Lock, 6 strategy rows (name + Enter + Exit), CHART + TT, INDICES; spread evenly down to the app icons -->
                       <LinearLayout android:layout_width="wrap_content" android:layout_height="match_parent"
                           android:orientation="vertical" android:layout_marginEnd="10dp">
                           <FrameLayout android:layout_width="wrap_content" android:layout_height="0dp" android:layout_weight="1">
@@ -2448,52 +2460,98 @@ jobs:
                                   android:text="☐ Lock" android:textColor="#FFFFFF" android:textSize="14sp" android:textStyle="bold"
                                   android:singleLine="true"/>
                           </FrameLayout>
-                          <FrameLayout android:layout_width="wrap_content" android:layout_height="0dp" android:layout_weight="1">
-                              <TextView android:id="@+id/mle" android:layout_width="66dp" android:layout_height="wrap_content"
-                                  android:layout_gravity="center_vertical" android:gravity="center"
-                                  android:paddingTop="4dp" android:paddingBottom="4dp" android:background="@drawable/idx_btn"
-                                  android:text="ENTER" android:textColor="#FFFFFF" android:textSize="11sp" android:textStyle="bold"
+                          <LinearLayout android:layout_width="wrap_content" android:layout_height="0dp" android:layout_weight="1"
+                              android:orientation="horizontal" android:gravity="center_vertical">
+                              <TextView android:layout_width="54dp" android:layout_height="wrap_content" android:text="Long"
+                                  android:textColor="#4CD964" android:textSize="12sp" android:textStyle="bold" android:singleLine="true"/>
+                              <TextView android:id="@+id/mle" android:layout_width="46dp" android:layout_height="wrap_content"
+                                  android:gravity="center" android:paddingTop="4dp" android:paddingBottom="4dp" android:background="@drawable/idx_btn"
+                                  android:text="Enter" android:textColor="#FFFFFF" android:textSize="11sp" android:textStyle="bold"
                                   android:singleLine="true"/>
-                          </FrameLayout>
-                          <FrameLayout android:layout_width="wrap_content" android:layout_height="0dp" android:layout_weight="1">
-                              <TextView android:id="@+id/mlx" android:layout_width="66dp" android:layout_height="wrap_content"
-                                  android:layout_gravity="center_vertical" android:gravity="center"
-                                  android:paddingTop="4dp" android:paddingBottom="4dp" android:background="@drawable/idx_btn"
-                                  android:text="EXIT" android:textColor="#FFFFFF" android:textSize="11sp" android:textStyle="bold"
+                              <TextView android:id="@+id/mlx" android:layout_width="46dp" android:layout_height="wrap_content" android:layout_marginStart="4dp"
+                                  android:gravity="center" android:paddingTop="4dp" android:paddingBottom="4dp" android:background="@drawable/red_btn"
+                                  android:text="Exit" android:textColor="#FFFFFF" android:textSize="11sp" android:textStyle="bold"
                                   android:singleLine="true"/>
-                          </FrameLayout>
-                          <FrameLayout android:layout_width="wrap_content" android:layout_height="0dp" android:layout_weight="1">
-                              <TextView android:id="@+id/mse" android:layout_width="66dp" android:layout_height="wrap_content"
-                                  android:layout_gravity="center_vertical" android:gravity="center"
-                                  android:paddingTop="4dp" android:paddingBottom="4dp" android:background="@drawable/red_btn"
-                                  android:text="ENTER" android:textColor="#FFFFFF" android:textSize="11sp" android:textStyle="bold"
+                          </LinearLayout>
+                          <LinearLayout android:layout_width="wrap_content" android:layout_height="0dp" android:layout_weight="1"
+                              android:orientation="horizontal" android:gravity="center_vertical">
+                              <TextView android:layout_width="54dp" android:layout_height="wrap_content" android:text="Short"
+                                  android:textColor="#FF5A5F" android:textSize="12sp" android:textStyle="bold" android:singleLine="true"/>
+                              <TextView android:id="@+id/mse" android:layout_width="46dp" android:layout_height="wrap_content"
+                                  android:gravity="center" android:paddingTop="4dp" android:paddingBottom="4dp" android:background="@drawable/idx_btn"
+                                  android:text="Enter" android:textColor="#FFFFFF" android:textSize="11sp" android:textStyle="bold"
                                   android:singleLine="true"/>
-                          </FrameLayout>
-                          <FrameLayout android:layout_width="wrap_content" android:layout_height="0dp" android:layout_weight="1">
-                              <TextView android:id="@+id/msx" android:layout_width="66dp" android:layout_height="wrap_content"
-                                  android:layout_gravity="center_vertical" android:gravity="center"
-                                  android:paddingTop="4dp" android:paddingBottom="4dp" android:background="@drawable/red_btn"
-                                  android:text="EXIT" android:textColor="#FFFFFF" android:textSize="11sp" android:textStyle="bold"
+                              <TextView android:id="@+id/msx" android:layout_width="46dp" android:layout_height="wrap_content" android:layout_marginStart="4dp"
+                                  android:gravity="center" android:paddingTop="4dp" android:paddingBottom="4dp" android:background="@drawable/red_btn"
+                                  android:text="Exit" android:textColor="#FFFFFF" android:textSize="11sp" android:textStyle="bold"
                                   android:singleLine="true"/>
-                          </FrameLayout>
-                          <FrameLayout android:layout_width="wrap_content" android:layout_height="0dp" android:layout_weight="1">
-                              <TextView android:id="@+id/stratbtn" android:layout_width="66dp" android:layout_height="wrap_content"
-                                  android:layout_gravity="center_vertical" android:gravity="center"
-                                  android:paddingTop="4dp" android:paddingBottom="4dp" android:background="@drawable/purple_btn"
-                                  android:text="TT" android:textColor="#FFFFFF" android:textSize="11sp" android:textStyle="bold"
+                          </LinearLayout>
+                          <LinearLayout android:layout_width="wrap_content" android:layout_height="0dp" android:layout_weight="1"
+                              android:orientation="horizontal" android:gravity="center_vertical">
+                              <TextView android:layout_width="54dp" android:layout_height="wrap_content" android:text="Bull"
+                                  android:textColor="#4CD964" android:textSize="12sp" android:textStyle="bold" android:singleLine="true"/>
+                              <TextView android:id="@+id/mue" android:layout_width="46dp" android:layout_height="wrap_content"
+                                  android:gravity="center" android:paddingTop="4dp" android:paddingBottom="4dp" android:background="@drawable/idx_btn"
+                                  android:text="Enter" android:textColor="#FFFFFF" android:textSize="11sp" android:textStyle="bold"
                                   android:singleLine="true"/>
-                          </FrameLayout>
-                          <FrameLayout android:layout_width="wrap_content" android:layout_height="0dp" android:layout_weight="1">
-                              <TextView android:id="@+id/chartbtn" android:layout_width="66dp" android:layout_height="wrap_content"
-                                  android:layout_gravity="center_vertical" android:gravity="center"
-                                  android:paddingTop="4dp" android:paddingBottom="4dp" android:background="@drawable/purple_btn"
+                              <TextView android:id="@+id/mux" android:layout_width="46dp" android:layout_height="wrap_content" android:layout_marginStart="4dp"
+                                  android:gravity="center" android:paddingTop="4dp" android:paddingBottom="4dp" android:background="@drawable/red_btn"
+                                  android:text="Exit" android:textColor="#FFFFFF" android:textSize="11sp" android:textStyle="bold"
+                                  android:singleLine="true"/>
+                          </LinearLayout>
+                          <LinearLayout android:layout_width="wrap_content" android:layout_height="0dp" android:layout_weight="1"
+                              android:orientation="horizontal" android:gravity="center_vertical">
+                              <TextView android:layout_width="54dp" android:layout_height="wrap_content" android:text="Bear"
+                                  android:textColor="#FF5A5F" android:textSize="12sp" android:textStyle="bold" android:singleLine="true"/>
+                              <TextView android:id="@+id/mde" android:layout_width="46dp" android:layout_height="wrap_content"
+                                  android:gravity="center" android:paddingTop="4dp" android:paddingBottom="4dp" android:background="@drawable/idx_btn"
+                                  android:text="Enter" android:textColor="#FFFFFF" android:textSize="11sp" android:textStyle="bold"
+                                  android:singleLine="true"/>
+                              <TextView android:id="@+id/mdx" android:layout_width="46dp" android:layout_height="wrap_content" android:layout_marginStart="4dp"
+                                  android:gravity="center" android:paddingTop="4dp" android:paddingBottom="4dp" android:background="@drawable/red_btn"
+                                  android:text="Exit" android:textColor="#FFFFFF" android:textSize="11sp" android:textStyle="bold"
+                                  android:singleLine="true"/>
+                          </LinearLayout>
+                          <LinearLayout android:layout_width="wrap_content" android:layout_height="0dp" android:layout_weight="1"
+                              android:orientation="horizontal" android:gravity="center_vertical">
+                              <TextView android:layout_width="54dp" android:layout_height="wrap_content" android:text="Bull 4H"
+                                  android:textColor="#4CD964" android:textSize="12sp" android:textStyle="bold" android:singleLine="true"/>
+                              <TextView android:id="@+id/mu4e" android:layout_width="46dp" android:layout_height="wrap_content"
+                                  android:gravity="center" android:paddingTop="4dp" android:paddingBottom="4dp" android:background="@drawable/idx_btn"
+                                  android:text="Enter" android:textColor="#FFFFFF" android:textSize="11sp" android:textStyle="bold"
+                                  android:singleLine="true"/>
+                              <TextView android:id="@+id/mu4x" android:layout_width="46dp" android:layout_height="wrap_content" android:layout_marginStart="4dp"
+                                  android:gravity="center" android:paddingTop="4dp" android:paddingBottom="4dp" android:background="@drawable/red_btn"
+                                  android:text="Exit" android:textColor="#FFFFFF" android:textSize="11sp" android:textStyle="bold"
+                                  android:singleLine="true"/>
+                          </LinearLayout>
+                          <LinearLayout android:layout_width="wrap_content" android:layout_height="0dp" android:layout_weight="1"
+                              android:orientation="horizontal" android:gravity="center_vertical">
+                              <TextView android:layout_width="54dp" android:layout_height="wrap_content" android:text="Bear 4H"
+                                  android:textColor="#FF5A5F" android:textSize="12sp" android:textStyle="bold" android:singleLine="true"/>
+                              <TextView android:id="@+id/md4e" android:layout_width="46dp" android:layout_height="wrap_content"
+                                  android:gravity="center" android:paddingTop="4dp" android:paddingBottom="4dp" android:background="@drawable/idx_btn"
+                                  android:text="Enter" android:textColor="#FFFFFF" android:textSize="11sp" android:textStyle="bold"
+                                  android:singleLine="true"/>
+                              <TextView android:id="@+id/md4x" android:layout_width="46dp" android:layout_height="wrap_content" android:layout_marginStart="4dp"
+                                  android:gravity="center" android:paddingTop="4dp" android:paddingBottom="4dp" android:background="@drawable/red_btn"
+                                  android:text="Exit" android:textColor="#FFFFFF" android:textSize="11sp" android:textStyle="bold"
+                                  android:singleLine="true"/>
+                          </LinearLayout>
+                          <LinearLayout android:layout_width="wrap_content" android:layout_height="0dp" android:layout_weight="1"
+                              android:orientation="horizontal" android:gravity="center_vertical">
+                              <TextView android:id="@+id/chartbtn" android:layout_width="73dp" android:layout_height="wrap_content"
+                                  android:gravity="center" android:paddingTop="4dp" android:paddingBottom="4dp" android:background="@drawable/purple_btn"
                                   android:text="CHART" android:textColor="#FFFFFF" android:textSize="11sp" android:textStyle="bold"
                                   android:singleLine="true"/>
-                          </FrameLayout>
+                              <TextView android:id="@+id/stratbtn" android:layout_width="73dp" android:layout_height="wrap_content" android:layout_marginStart="4dp"
+                                  android:gravity="center" android:paddingTop="4dp" android:paddingBottom="4dp" android:background="@drawable/purple_btn"
+                                  android:text="TT" android:textColor="#FFFFFF" android:textSize="11sp" android:textStyle="bold"
+                                  android:singleLine="true"/>
+                          </LinearLayout>
                           <FrameLayout android:layout_width="wrap_content" android:layout_height="0dp" android:layout_weight="1">
-                              <TextView android:id="@+id/idxbtn" android:layout_width="66dp" android:layout_height="wrap_content"
-                                  android:layout_gravity="center_vertical" android:gravity="center"
-                                  android:paddingTop="4dp" android:paddingBottom="4dp" android:background="@drawable/purple_btn"
+                              <TextView android:id="@+id/idxbtn" android:layout_width="150dp" android:layout_height="wrap_content" android:layout_gravity="center_vertical"
+                                  android:gravity="center" android:paddingTop="4dp" android:paddingBottom="4dp" android:background="@drawable/purple_btn"
                                   android:text="INDICES" android:textColor="#FFFFFF" android:textSize="11sp" android:textStyle="bold"
                                   android:singleLine="true"/>
                           </FrameLayout>
