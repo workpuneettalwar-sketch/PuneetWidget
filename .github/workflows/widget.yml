@@ -1796,13 +1796,10 @@ jobs:
               private fun initWidget() {
                   if (acct2) return
                   val rv = RemoteViews(packageName, R.layout.widget)
-                  rv.setOnClickPendingIntent(R.id.tthead, openPi(1))
+                  rv.setOnClickPendingIntent(R.id.tthead, null)
                   rv.setOnClickPendingIntent(R.id.ttgear, PendingIntent.getActivity(this, 3,
                       Intent(this, com.btcwidget.SettingsActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK), PendingIntent.FLAG_IMMUTABLE))
                   rv.setRemoteAdapter(R.id.ttlist, Intent(this, TtListService::class.java))
-                  rv.setPendingIntentTemplate(R.id.ttlist, PendingIntent.getActivity(this, 8,
-                      Intent(this, OpenActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
-                      PendingIntent.FLAG_MUTABLE or PendingIntent.FLAG_UPDATE_CURRENT))
                   AppWidgetManager.getInstance(this).partiallyUpdateAppWidget(ids(), rv)
                   lastSig = ""
               }
@@ -1813,10 +1810,10 @@ jobs:
               }
 
               private fun sortRows(l: List<Row>): List<Row> {
-                  val order = listOf(Level.BAD, Level.WARN, Level.LIVE, Level.IDLE, Level.DONE, Level.PAUSED)
-                  var r = l
-                  if (Prefs.hideExited(this)) r = r.filter { Status.level(it.status) != Level.DONE }
-                  return r.sortedBy { order.indexOf(Status.level(it.status)) }
+                  // only what matters: errors, things to check, and strategies in a trade (Live-Entered).
+                  // Active (waiting), Paused and Exited ones are not listed.
+                  val order = listOf(Level.BAD, Level.WARN, Level.LIVE)
+                  return l.filter { Status.level(it.status) in order }.sortedBy { order.indexOf(Status.level(it.status)) }
               }
 
               private fun render() {
@@ -1907,7 +1904,6 @@ jobs:
                           hb.setSpan(StyleSpan(Typeface.BOLD), 0, hb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
                           rv.setTextViewText(R.id.ttrow, hb)
                           rv.setTextViewTextSize(R.id.ttrow, TypedValue.COMPLEX_UNIT_SP, ts)
-                          rv.setOnClickFillInIntent(R.id.ttrow, Intent())
                           return rv
                       }
                       val lv = Status.level(r.status)
@@ -1919,7 +1915,6 @@ jobs:
                       sb.append(r.name.ifEmpty { r.id.ifEmpty { "?" } })
                       rv.setTextViewText(R.id.ttrow, sb)
                       rv.setTextViewTextSize(R.id.ttrow, TypedValue.COMPLEX_UNIT_SP, ts)
-                      rv.setOnClickFillInIntent(R.id.ttrow, Intent())
                       return rv
                   }
                   override fun getLoadingView(): RemoteViews? = null
@@ -2107,7 +2102,6 @@ jobs:
                   button("Allow running in background (battery)") { askBattery() }
 
                   label("Widget", 16f)
-                  switch("Hide Exited / Archived strategies", "hideExited", true)
                   seek("Text size of the Tradetron lines", "tsize", 13, 9, 22)
                   appBtn = button("") { pickApp() }
                   updateAppBtn()
@@ -2462,8 +2456,8 @@ jobs:
                           </FrameLayout>
                           <LinearLayout android:layout_width="wrap_content" android:layout_height="0dp" android:layout_weight="1"
                               android:orientation="horizontal" android:gravity="center_vertical">
-                              <TextView android:layout_width="54dp" android:layout_height="wrap_content" android:text="Long"
-                                  android:textColor="#4CD964" android:textSize="12sp" android:textStyle="bold" android:singleLine="true"/>
+                              <TextView android:layout_width="60dp" android:layout_height="wrap_content" android:text="Long"
+                                  android:textColor="#FFFFFF" android:textSize="13sp" android:textStyle="bold" android:singleLine="true"/>
                               <TextView android:id="@+id/mle" android:layout_width="46dp" android:layout_height="wrap_content"
                                   android:gravity="center" android:paddingTop="4dp" android:paddingBottom="4dp" android:background="@drawable/idx_btn"
                                   android:text="Enter" android:textColor="#FFFFFF" android:textSize="11sp" android:textStyle="bold"
@@ -2475,8 +2469,8 @@ jobs:
                           </LinearLayout>
                           <LinearLayout android:layout_width="wrap_content" android:layout_height="0dp" android:layout_weight="1"
                               android:orientation="horizontal" android:gravity="center_vertical">
-                              <TextView android:layout_width="54dp" android:layout_height="wrap_content" android:text="Short"
-                                  android:textColor="#FF5A5F" android:textSize="12sp" android:textStyle="bold" android:singleLine="true"/>
+                              <TextView android:layout_width="60dp" android:layout_height="wrap_content" android:text="Short"
+                                  android:textColor="#FFFFFF" android:textSize="13sp" android:textStyle="bold" android:singleLine="true"/>
                               <TextView android:id="@+id/mse" android:layout_width="46dp" android:layout_height="wrap_content"
                                   android:gravity="center" android:paddingTop="4dp" android:paddingBottom="4dp" android:background="@drawable/idx_btn"
                                   android:text="Enter" android:textColor="#FFFFFF" android:textSize="11sp" android:textStyle="bold"
@@ -2488,8 +2482,8 @@ jobs:
                           </LinearLayout>
                           <LinearLayout android:layout_width="wrap_content" android:layout_height="0dp" android:layout_weight="1"
                               android:orientation="horizontal" android:gravity="center_vertical">
-                              <TextView android:layout_width="54dp" android:layout_height="wrap_content" android:text="Bull"
-                                  android:textColor="#4CD964" android:textSize="12sp" android:textStyle="bold" android:singleLine="true"/>
+                              <TextView android:layout_width="60dp" android:layout_height="wrap_content" android:text="Bull"
+                                  android:textColor="#FFFFFF" android:textSize="13sp" android:textStyle="bold" android:singleLine="true"/>
                               <TextView android:id="@+id/mue" android:layout_width="46dp" android:layout_height="wrap_content"
                                   android:gravity="center" android:paddingTop="4dp" android:paddingBottom="4dp" android:background="@drawable/idx_btn"
                                   android:text="Enter" android:textColor="#FFFFFF" android:textSize="11sp" android:textStyle="bold"
@@ -2501,8 +2495,8 @@ jobs:
                           </LinearLayout>
                           <LinearLayout android:layout_width="wrap_content" android:layout_height="0dp" android:layout_weight="1"
                               android:orientation="horizontal" android:gravity="center_vertical">
-                              <TextView android:layout_width="54dp" android:layout_height="wrap_content" android:text="Bear"
-                                  android:textColor="#FF5A5F" android:textSize="12sp" android:textStyle="bold" android:singleLine="true"/>
+                              <TextView android:layout_width="60dp" android:layout_height="wrap_content" android:text="Bear"
+                                  android:textColor="#FFFFFF" android:textSize="13sp" android:textStyle="bold" android:singleLine="true"/>
                               <TextView android:id="@+id/mde" android:layout_width="46dp" android:layout_height="wrap_content"
                                   android:gravity="center" android:paddingTop="4dp" android:paddingBottom="4dp" android:background="@drawable/idx_btn"
                                   android:text="Enter" android:textColor="#FFFFFF" android:textSize="11sp" android:textStyle="bold"
@@ -2514,8 +2508,8 @@ jobs:
                           </LinearLayout>
                           <LinearLayout android:layout_width="wrap_content" android:layout_height="0dp" android:layout_weight="1"
                               android:orientation="horizontal" android:gravity="center_vertical">
-                              <TextView android:layout_width="54dp" android:layout_height="wrap_content" android:text="Bull 4H"
-                                  android:textColor="#4CD964" android:textSize="12sp" android:textStyle="bold" android:singleLine="true"/>
+                              <TextView android:layout_width="60dp" android:layout_height="wrap_content" android:text="Bull 4H"
+                                  android:textColor="#FFFFFF" android:textSize="13sp" android:textStyle="bold" android:singleLine="true"/>
                               <TextView android:id="@+id/mu4e" android:layout_width="46dp" android:layout_height="wrap_content"
                                   android:gravity="center" android:paddingTop="4dp" android:paddingBottom="4dp" android:background="@drawable/idx_btn"
                                   android:text="Enter" android:textColor="#FFFFFF" android:textSize="11sp" android:textStyle="bold"
@@ -2527,8 +2521,8 @@ jobs:
                           </LinearLayout>
                           <LinearLayout android:layout_width="wrap_content" android:layout_height="0dp" android:layout_weight="1"
                               android:orientation="horizontal" android:gravity="center_vertical">
-                              <TextView android:layout_width="54dp" android:layout_height="wrap_content" android:text="Bear 4H"
-                                  android:textColor="#FF5A5F" android:textSize="12sp" android:textStyle="bold" android:singleLine="true"/>
+                              <TextView android:layout_width="60dp" android:layout_height="wrap_content" android:text="Bear 4H"
+                                  android:textColor="#FFFFFF" android:textSize="13sp" android:textStyle="bold" android:singleLine="true"/>
                               <TextView android:id="@+id/md4e" android:layout_width="46dp" android:layout_height="wrap_content"
                                   android:gravity="center" android:paddingTop="4dp" android:paddingBottom="4dp" android:background="@drawable/idx_btn"
                                   android:text="Enter" android:textColor="#FFFFFF" android:textSize="11sp" android:textStyle="bold"
@@ -2540,17 +2534,17 @@ jobs:
                           </LinearLayout>
                           <LinearLayout android:layout_width="wrap_content" android:layout_height="0dp" android:layout_weight="1"
                               android:orientation="horizontal" android:gravity="center_vertical">
-                              <TextView android:id="@+id/chartbtn" android:layout_width="73dp" android:layout_height="wrap_content"
+                              <TextView android:id="@+id/chartbtn" android:layout_width="76dp" android:layout_height="wrap_content"
                                   android:gravity="center" android:paddingTop="4dp" android:paddingBottom="4dp" android:background="@drawable/purple_btn"
                                   android:text="CHART" android:textColor="#FFFFFF" android:textSize="11sp" android:textStyle="bold"
                                   android:singleLine="true"/>
-                              <TextView android:id="@+id/stratbtn" android:layout_width="73dp" android:layout_height="wrap_content" android:layout_marginStart="4dp"
+                              <TextView android:id="@+id/stratbtn" android:layout_width="76dp" android:layout_height="wrap_content" android:layout_marginStart="4dp"
                                   android:gravity="center" android:paddingTop="4dp" android:paddingBottom="4dp" android:background="@drawable/purple_btn"
                                   android:text="TT" android:textColor="#FFFFFF" android:textSize="11sp" android:textStyle="bold"
                                   android:singleLine="true"/>
                           </LinearLayout>
                           <FrameLayout android:layout_width="wrap_content" android:layout_height="0dp" android:layout_weight="1">
-                              <TextView android:id="@+id/idxbtn" android:layout_width="150dp" android:layout_height="wrap_content" android:layout_gravity="center_vertical"
+                              <TextView android:id="@+id/idxbtn" android:layout_width="156dp" android:layout_height="wrap_content" android:layout_gravity="center_vertical"
                                   android:gravity="center" android:paddingTop="4dp" android:paddingBottom="4dp" android:background="@drawable/purple_btn"
                                   android:text="INDICES" android:textColor="#FFFFFF" android:textSize="11sp" android:textStyle="bold"
                                   android:singleLine="true"/>
@@ -2573,7 +2567,7 @@ jobs:
                                       android:src="@android:drawable/ic_menu_manage" android:alpha="0.8"/>
                               </LinearLayout>
                               <TextView android:id="@+id/ttempty" android:layout_width="match_parent" android:layout_height="wrap_content"
-                                  android:text="No running strategies" android:textColor="#AAAAAA" android:textSize="12sp"
+                                  android:text="Nothing in a trade or needing attention" android:textColor="#AAAAAA" android:textSize="12sp"
                                   android:visibility="gone" android:paddingTop="2dp"/>
                               <ListView android:id="@+id/ttlist" android:layout_width="match_parent" android:layout_height="0dp" android:layout_weight="1"
                                   android:divider="@null" android:dividerHeight="0dp" android:scrollbars="vertical"
