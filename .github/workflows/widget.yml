@@ -701,11 +701,10 @@ jobs:
           import java.net.HttpURLConnection
           import java.net.URL
 
-          /** Behind the 12 manual buttons: sends the saved Tradetron API link for that button (after an optional confirm). */
+          /** Behind the 8 manual buttons: sends the saved Tradetron API link for that button (after an optional confirm). */
           class ManualActivity : Activity() {
               private val names = mapOf("le" to "LONG ENTER", "lx" to "LONG EXIT", "se" to "SHORT ENTER", "sx" to "SHORT EXIT",
-                  "ue" to "BULL ENTER", "ux" to "BULL EXIT", "de" to "BEAR ENTER", "dx" to "BEAR EXIT",
-                  "u4e" to "BULL 4H ENTER", "u4x" to "BULL 4H EXIT", "d4e" to "BEAR 4H ENTER", "d4x" to "BEAR 4H EXIT")
+                  "l4e" to "LONG 4H ENTER", "l4x" to "LONG 4H EXIT", "s4e" to "SHORT 4H ENTER", "s4x" to "SHORT 4H EXIT")
 
               override fun onCreate(b: Bundle?) {
                   super.onCreate(b)
@@ -924,14 +923,10 @@ jobs:
                   field("link_lx", "Long: Exit link")
                   field("link_se", "Short: Enter link")
                   field("link_sx", "Short: Exit link")
-                  field("link_ue", "Bull: Enter link")
-                  field("link_ux", "Bull: Exit link")
-                  field("link_de", "Bear: Enter link")
-                  field("link_dx", "Bear: Exit link")
-                  field("link_u4e", "Bull 4H: Enter link")
-                  field("link_u4x", "Bull 4H: Exit link")
-                  field("link_d4e", "Bear 4H: Enter link")
-                  field("link_d4x", "Bear 4H: Exit link")
+                  field("link_l4e", "Long 4H: Enter link")
+                  field("link_l4x", "Long 4H: Exit link")
+                  field("link_s4e", "Short 4H: Enter link")
+                  field("link_s4x", "Short 4H: Exit link")
                   root.addView(CheckBox(this).apply {
                       text = "Ask \"Are you sure?\" before sending (protects against accidental taps)"
                       isChecked = sp.getBoolean("mconfirm", true)
@@ -1170,8 +1165,7 @@ jobs:
                       Intent(this, WidgetProvider::class.java).setAction(Prefs.ACTION_LOCK),
                       PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT))
                   for ((i, pair) in listOf(R.id.mle to "le", R.id.mlx to "lx", R.id.mse to "se", R.id.msx to "sx",
-                          R.id.mue to "ue", R.id.mux to "ux", R.id.mde to "de", R.id.mdx to "dx",
-                          R.id.mu4e to "u4e", R.id.mu4x to "u4x", R.id.md4e to "d4e", R.id.md4x to "d4x").withIndex()) {
+                          R.id.ml4e to "l4e", R.id.ml4x to "l4x", R.id.ms4e to "s4e", R.id.ms4x to "s4x").withIndex()) {
                       rv.setOnClickPendingIntent(pair.first, PendingIntent.getActivity(this, 40 + i,
                           Intent(this, ManualActivity::class.java).putExtra("k", pair.second).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
                           PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT))
@@ -2445,7 +2439,7 @@ jobs:
                   android:orientation="vertical" android:padding="8dp">
                   <LinearLayout android:layout_width="match_parent" android:layout_height="0dp" android:layout_weight="1"
                       android:orientation="horizontal">
-                      <!-- left: Lock, 6 strategy rows (name + Enter + Exit), CHART + TT, INDICES; spread evenly down to the app icons -->
+                      <!-- left: Lock, 4 strategy rows (name + Enter + Exit), CHART + TT, INDICES; spread evenly down to the app icons -->
                       <LinearLayout android:layout_width="wrap_content" android:layout_height="match_parent"
                           android:orientation="vertical" android:layout_marginEnd="10dp">
                           <FrameLayout android:layout_width="wrap_content" android:layout_height="0dp" android:layout_weight="1">
@@ -2456,7 +2450,7 @@ jobs:
                           </FrameLayout>
                           <LinearLayout android:layout_width="wrap_content" android:layout_height="0dp" android:layout_weight="1"
                               android:orientation="horizontal" android:gravity="center_vertical">
-                              <TextView android:layout_width="60dp" android:layout_height="wrap_content" android:text="Long"
+                              <TextView android:layout_width="66dp" android:layout_height="wrap_content" android:text="Long"
                                   android:textColor="#FFFFFF" android:textSize="13sp" android:textStyle="bold" android:singleLine="true"/>
                               <TextView android:id="@+id/mle" android:layout_width="46dp" android:layout_height="wrap_content"
                                   android:gravity="center" android:paddingTop="4dp" android:paddingBottom="4dp" android:background="@drawable/idx_btn"
@@ -2469,7 +2463,7 @@ jobs:
                           </LinearLayout>
                           <LinearLayout android:layout_width="wrap_content" android:layout_height="0dp" android:layout_weight="1"
                               android:orientation="horizontal" android:gravity="center_vertical">
-                              <TextView android:layout_width="60dp" android:layout_height="wrap_content" android:text="Short"
+                              <TextView android:layout_width="66dp" android:layout_height="wrap_content" android:text="Short"
                                   android:textColor="#FFFFFF" android:textSize="13sp" android:textStyle="bold" android:singleLine="true"/>
                               <TextView android:id="@+id/mse" android:layout_width="46dp" android:layout_height="wrap_content"
                                   android:gravity="center" android:paddingTop="4dp" android:paddingBottom="4dp" android:background="@drawable/idx_btn"
@@ -2482,69 +2476,43 @@ jobs:
                           </LinearLayout>
                           <LinearLayout android:layout_width="wrap_content" android:layout_height="0dp" android:layout_weight="1"
                               android:orientation="horizontal" android:gravity="center_vertical">
-                              <TextView android:layout_width="60dp" android:layout_height="wrap_content" android:text="Bull"
+                              <TextView android:layout_width="66dp" android:layout_height="wrap_content" android:text="Long 4H"
                                   android:textColor="#FFFFFF" android:textSize="13sp" android:textStyle="bold" android:singleLine="true"/>
-                              <TextView android:id="@+id/mue" android:layout_width="46dp" android:layout_height="wrap_content"
+                              <TextView android:id="@+id/ml4e" android:layout_width="46dp" android:layout_height="wrap_content"
                                   android:gravity="center" android:paddingTop="4dp" android:paddingBottom="4dp" android:background="@drawable/idx_btn"
                                   android:text="Enter" android:textColor="#FFFFFF" android:textSize="11sp" android:textStyle="bold"
                                   android:singleLine="true"/>
-                              <TextView android:id="@+id/mux" android:layout_width="46dp" android:layout_height="wrap_content" android:layout_marginStart="4dp"
+                              <TextView android:id="@+id/ml4x" android:layout_width="46dp" android:layout_height="wrap_content" android:layout_marginStart="4dp"
                                   android:gravity="center" android:paddingTop="4dp" android:paddingBottom="4dp" android:background="@drawable/red_btn"
                                   android:text="Exit" android:textColor="#FFFFFF" android:textSize="11sp" android:textStyle="bold"
                                   android:singleLine="true"/>
                           </LinearLayout>
                           <LinearLayout android:layout_width="wrap_content" android:layout_height="0dp" android:layout_weight="1"
                               android:orientation="horizontal" android:gravity="center_vertical">
-                              <TextView android:layout_width="60dp" android:layout_height="wrap_content" android:text="Bear"
+                              <TextView android:layout_width="66dp" android:layout_height="wrap_content" android:text="Short 4H"
                                   android:textColor="#FFFFFF" android:textSize="13sp" android:textStyle="bold" android:singleLine="true"/>
-                              <TextView android:id="@+id/mde" android:layout_width="46dp" android:layout_height="wrap_content"
+                              <TextView android:id="@+id/ms4e" android:layout_width="46dp" android:layout_height="wrap_content"
                                   android:gravity="center" android:paddingTop="4dp" android:paddingBottom="4dp" android:background="@drawable/idx_btn"
                                   android:text="Enter" android:textColor="#FFFFFF" android:textSize="11sp" android:textStyle="bold"
                                   android:singleLine="true"/>
-                              <TextView android:id="@+id/mdx" android:layout_width="46dp" android:layout_height="wrap_content" android:layout_marginStart="4dp"
+                              <TextView android:id="@+id/ms4x" android:layout_width="46dp" android:layout_height="wrap_content" android:layout_marginStart="4dp"
                                   android:gravity="center" android:paddingTop="4dp" android:paddingBottom="4dp" android:background="@drawable/red_btn"
                                   android:text="Exit" android:textColor="#FFFFFF" android:textSize="11sp" android:textStyle="bold"
                                   android:singleLine="true"/>
                           </LinearLayout>
                           <LinearLayout android:layout_width="wrap_content" android:layout_height="0dp" android:layout_weight="1"
                               android:orientation="horizontal" android:gravity="center_vertical">
-                              <TextView android:layout_width="60dp" android:layout_height="wrap_content" android:text="Bull 4H"
-                                  android:textColor="#FFFFFF" android:textSize="13sp" android:textStyle="bold" android:singleLine="true"/>
-                              <TextView android:id="@+id/mu4e" android:layout_width="46dp" android:layout_height="wrap_content"
-                                  android:gravity="center" android:paddingTop="4dp" android:paddingBottom="4dp" android:background="@drawable/idx_btn"
-                                  android:text="Enter" android:textColor="#FFFFFF" android:textSize="11sp" android:textStyle="bold"
-                                  android:singleLine="true"/>
-                              <TextView android:id="@+id/mu4x" android:layout_width="46dp" android:layout_height="wrap_content" android:layout_marginStart="4dp"
-                                  android:gravity="center" android:paddingTop="4dp" android:paddingBottom="4dp" android:background="@drawable/red_btn"
-                                  android:text="Exit" android:textColor="#FFFFFF" android:textSize="11sp" android:textStyle="bold"
-                                  android:singleLine="true"/>
-                          </LinearLayout>
-                          <LinearLayout android:layout_width="wrap_content" android:layout_height="0dp" android:layout_weight="1"
-                              android:orientation="horizontal" android:gravity="center_vertical">
-                              <TextView android:layout_width="60dp" android:layout_height="wrap_content" android:text="Bear 4H"
-                                  android:textColor="#FFFFFF" android:textSize="13sp" android:textStyle="bold" android:singleLine="true"/>
-                              <TextView android:id="@+id/md4e" android:layout_width="46dp" android:layout_height="wrap_content"
-                                  android:gravity="center" android:paddingTop="4dp" android:paddingBottom="4dp" android:background="@drawable/idx_btn"
-                                  android:text="Enter" android:textColor="#FFFFFF" android:textSize="11sp" android:textStyle="bold"
-                                  android:singleLine="true"/>
-                              <TextView android:id="@+id/md4x" android:layout_width="46dp" android:layout_height="wrap_content" android:layout_marginStart="4dp"
-                                  android:gravity="center" android:paddingTop="4dp" android:paddingBottom="4dp" android:background="@drawable/red_btn"
-                                  android:text="Exit" android:textColor="#FFFFFF" android:textSize="11sp" android:textStyle="bold"
-                                  android:singleLine="true"/>
-                          </LinearLayout>
-                          <LinearLayout android:layout_width="wrap_content" android:layout_height="0dp" android:layout_weight="1"
-                              android:orientation="horizontal" android:gravity="center_vertical">
-                              <TextView android:id="@+id/chartbtn" android:layout_width="76dp" android:layout_height="wrap_content"
+                              <TextView android:id="@+id/chartbtn" android:layout_width="79dp" android:layout_height="wrap_content"
                                   android:gravity="center" android:paddingTop="4dp" android:paddingBottom="4dp" android:background="@drawable/purple_btn"
                                   android:text="CHART" android:textColor="#FFFFFF" android:textSize="11sp" android:textStyle="bold"
                                   android:singleLine="true"/>
-                              <TextView android:id="@+id/stratbtn" android:layout_width="76dp" android:layout_height="wrap_content" android:layout_marginStart="4dp"
+                              <TextView android:id="@+id/stratbtn" android:layout_width="79dp" android:layout_height="wrap_content" android:layout_marginStart="4dp"
                                   android:gravity="center" android:paddingTop="4dp" android:paddingBottom="4dp" android:background="@drawable/purple_btn"
                                   android:text="TT" android:textColor="#FFFFFF" android:textSize="11sp" android:textStyle="bold"
                                   android:singleLine="true"/>
                           </LinearLayout>
                           <FrameLayout android:layout_width="wrap_content" android:layout_height="0dp" android:layout_weight="1">
-                              <TextView android:id="@+id/idxbtn" android:layout_width="156dp" android:layout_height="wrap_content" android:layout_gravity="center_vertical"
+                              <TextView android:id="@+id/idxbtn" android:layout_width="162dp" android:layout_height="wrap_content" android:layout_gravity="center_vertical"
                                   android:gravity="center" android:paddingTop="4dp" android:paddingBottom="4dp" android:background="@drawable/purple_btn"
                                   android:text="INDICES" android:textColor="#FFFFFF" android:textSize="11sp" android:textStyle="bold"
                                   android:singleLine="true"/>
