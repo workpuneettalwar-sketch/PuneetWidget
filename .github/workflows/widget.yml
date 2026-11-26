@@ -1245,6 +1245,7 @@ jobs:
                   rv.setTextViewText(R.id.price, if (price == null) "BTC --" else String.format(L, "BTC %,.1f", price))
                   showPnl(rv, R.id.pnl, R.id.pos, pnl, Delta.pnlErr)
                   update(rv)
+                  if (price != null && price > 0) try { Trigs.checkAlerts(this, price.toDouble()) } catch (_: Exception) {}
               }
 
               /** Secure Folder account PnL (own loop, every second like the old Secure Folder widget, so it never slows the main PnL). */
@@ -2497,6 +2498,51 @@ jobs:
                   } else am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, pi)
               }
 
+              /** Latest BTC price seen by the widget (0 = not known yet). */
+              @Volatile var lastPrice = 0.0
+
+              /** Notification + the same double beep as the TT alerts. */
+              fun beepNotify(c: Context, id: Int, title: String, text: String) {
+                  val nm = c.getSystemService(NotificationManager::class.java)
+                  val ch = NotificationChannel("alert", "Tradetron alerts", NotificationManager.IMPORTANCE_HIGH)
+                  ch.setSound(null, null); ch.enableVibration(true)
+                  nm.createNotificationChannel(ch)
+                  val open = PendingIntent.getActivity(c, 4998, Intent(c, TriggerActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK), PendingIntent.FLAG_IMMUTABLE)
+                  nm.notify(id, Notification.Builder(c, "alert")
+                      .setContentTitle(title).setContentText(text)
+                      .setStyle(Notification.BigTextStyle().bigText(text))
+                      .setSmallIcon(android.R.drawable.ic_lock_idle_alarm)
+                      .setCategory(Notification.CATEGORY_ALARM).setAutoCancel(true).setContentIntent(open).build())
+                  try {
+                      val tone = ToneGenerator(AudioManager.STREAM_ALARM, 100)
+                      tone.startTone(ToneGenerator.TONE_CDMA_HIGH_SS, 700)
+                      Handler(Looper.getMainLooper()).postDelayed({ try { tone.release() } catch (_: Exception) {} }, 1200)
+                  } catch (_: Exception) {}
+              }
+
+              /** Called with every BTC price the widget gets: fires price alerts that have been touched. */
+              fun checkAlerts(c: Context, price: Double) {
+                  lastPrice = price
+                  val raw = Prefs.str(c, "trigs")
+                  if (!raw.contains("\"al\"")) return
+                  val a = load(c); val out = JSONArray(); var changed = false
+                  for (i in 0 until a.length()) {
+                      val o = a.optJSONObject(i) ?: continue
+                      if (o.optString("t") != "al") { out.put(o); continue }
+                      val p = o.optDouble("p", 0.0)
+                      var d = o.optInt("d", 0)
+                      if (d == 0) { d = if (price < p) 1 else if (price > p) -1 else 2; o.put("d", d); changed = true }
+                      if (d == 2 || (d == 1 && price >= p) || (d == -1 && price <= p)) {
+                          changed = true
+                          val ps = o.optString("ps", p.toString())
+                          beepNotify(c, 7000 + (i % 900), "🔔 BTC ${if (d == -1) "fell to" else "reached"} $ps",
+                              String.format(Locale.US, "BTC is at %,.1f (your alert: %s)%s", price, ps,
+                                  o.optString("note").let { if (it.isEmpty()) "" else "\n$it" }))
+                      } else out.put(o)
+                  }
+                  if (changed) save(c, out)
+              }
+
               fun unschedule(c: Context, id: Int) = c.getSystemService(AlarmManager::class.java).cancel(alarmPi(c, id, ""))
 
               /** After a reboot: put the reminders back (ones already past fire straight away). */
@@ -2514,26 +2560,13 @@ jobs:
               override fun onReceive(c: Context, i: Intent) {
                   val id = i.getIntExtra("id", 0)
                   val note = i.getStringExtra("note").orEmpty().ifEmpty { "Reminder" }
-                  val nm = c.getSystemService(NotificationManager::class.java)
-                  val ch = NotificationChannel("alert", "Tradetron alerts", NotificationManager.IMPORTANCE_HIGH)
-                  ch.setSound(null, null); ch.enableVibration(true)
-                  nm.createNotificationChannel(ch)
-                  val open = PendingIntent.getActivity(c, 4998, Intent(c, TriggerActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK), PendingIntent.FLAG_IMMUTABLE)
-                  nm.notify(6000 + id, Notification.Builder(c, "alert")
-                      .setContentTitle("⏰ Reminder").setContentText(note)
-                      .setStyle(Notification.BigTextStyle().bigText(note))
-                      .setSmallIcon(android.R.drawable.ic_lock_idle_alarm)
-                      .setCategory(Notification.CATEGORY_ALARM).setAutoCancel(true).setContentIntent(open).build())
                   // remove it from the list
                   val a = Trigs.load(c); val out = JSONArray()
                   for (k in 0 until a.length()) { val o = a.optJSONObject(k) ?: continue; if (!(o.optString("t") == "rem" && o.optInt("id") == id)) out.put(o) }
                   Trigs.save(c, out)
                   val done = goAsync()
-                  try {
-                      val tone = ToneGenerator(AudioManager.STREAM_ALARM, 100)
-                      tone.startTone(ToneGenerator.TONE_CDMA_HIGH_SS, 700)
-                      Handler(Looper.getMainLooper()).postDelayed({ tone.release(); done.finish() }, 1200)
-                  } catch (_: Exception) { done.finish() }
+                  Trigs.beepNotify(c, 6000 + id, "⏰ Reminder", note)
+                  Handler(Looper.getMainLooper()).postDelayed({ done.finish() }, 1300)
               }
           }
 
@@ -2570,6 +2603,28 @@ jobs:
                   r1.addView(Button(this).apply { text = "CANCEL"; setOnClickListener { cancelTrigger(strat.selectedItemPosition, true) } },
                       LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
                   root.addView(r1)
+
+                  // ---- price alert (beep only) ----
+                  head("PRICE ALERT (beep only, no trade)")
+                  val ap = EditText(this).apply { hint = "BTC price, e.g. 92000"; inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL }
+                  root.addView(ap)
+                  val an = EditText(this).apply { hint = "Note (optional)" }
+                  root.addView(an)
+                  if (Trigs.lastPrice > 0) root.addView(TextView(this).apply {
+                      text = String.format(Locale.US, "BTC now: %,.1f. Beeps once when price touches your level, from either side.", Trigs.lastPrice)
+                      textSize = 12f; setTextColor(Color.GRAY) })
+                  root.addView(Button(this).apply { text = "ADD ALERT"; setOnClickListener {
+                      val v = ap.text.toString().trim().toDoubleOrNull()
+                      if (v == null || v <= 0) { toast("Enter a price"); return@setOnClickListener }
+                      val ps = if (v % 1.0 == 0.0) v.toLong().toString() else v.toString()
+                      val lp = Trigs.lastPrice
+                      val d = if (lp <= 0) 0 else if (lp < v) 1 else if (lp > v) -1 else 2
+                      val ctx = this@TriggerActivity
+                      val a = Trigs.load(ctx)
+                      a.put(JSONObject().put("t", "al").put("p", v).put("ps", ps).put("d", d).put("note", an.text.toString().trim()).put("set", System.currentTimeMillis()))
+                      Trigs.save(ctx, a)
+                      toast("Alert set at $ps"); ap.setText(""); an.setText(""); refresh()
+                  } })
 
                   // ---- reminder ----
                   head("REMINDER (double beep)")
@@ -2620,12 +2675,16 @@ jobs:
                   for (i in 0 until a.length()) {
                       val o = a.optJSONObject(i) ?: continue
                       val r = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
-                      val txt = if (o.optString("t") == "px")
-                          "🎯 ${o.optString("s")} at ${o.optString("p")}  (set ${tf.format(Date(o.optLong("set")))})"
-                      else "⏰ ${df.format(Date(o.optLong("at")))}  ${o.optString("note")}"
+                      val txt = when (o.optString("t")) {
+                          "px" -> "🎯 ${o.optString("s")} at ${o.optString("p")}  (set ${tf.format(Date(o.optLong("set")))})"
+                          "al" -> "🔔 BTC ${when (o.optInt("d")) { 1 -> "rises to "; -1 -> "falls to "; else -> "at " }}${o.optString("ps")}" +
+                              o.optString("note").let { if (it.isEmpty()) "" else "  $it" }
+                          else -> "⏰ ${df.format(Date(o.optLong("at")))}  ${o.optString("note")}"
+                      }
                       r.addView(TextView(this).apply { text = txt; textSize = 14f }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
                       r.addView(Button(this).apply { text = "✕"; setOnClickListener {
                           if (o.optString("t") == "px") cancelTrigger(Trigs.STRATS.indexOfFirst { it.first == o.optString("s") }, true)
+                          else if (o.optString("t") == "al") { val st = o.optLong("set"); remove { it.optString("t") == "al" && it.optLong("set") == st }; refresh() }
                           else { Trigs.unschedule(this@TriggerActivity, o.optInt("id")); remove { it.optString("t") == "rem" && it.optInt("id") == o.optInt("id") }; refresh() }
                       } })
                       list.addView(r)
