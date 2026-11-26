@@ -1671,6 +1671,23 @@ jobs:
 
               // ---------------------------------------------------------------- alerts
 
+              /** A strategy just entered: if a TRIG price trigger was placed on it, that trigger fired -> shrill beep + remove it from the list. */
+              private fun trigEntered(name: String) {
+                  try {
+                      val norm = { x: String -> x.lowercase().replace(Regex("[^a-z0-9]"), "") }
+                      val a = com.btcwidget.Trigs.load(this)
+                      val out = org.json.JSONArray()
+                      var hit: org.json.JSONObject? = null
+                      for (i in 0 until a.length()) {
+                          val o = a.optJSONObject(i) ?: continue
+                          if (hit == null && o.optString("t") == "px" && norm(o.optString("s")) == norm(name)) hit = o else out.put(o)
+                      }
+                      val h = hit ?: return
+                      com.btcwidget.Trigs.save(this, out)
+                      alert(7, "🎯 ${h.optString("s")} ENTERED by trigger", "${h.optString("s")} entered: your price trigger at ${h.optString("p")} fired. Check the trade.", true)
+                  } catch (_: Exception) {}
+              }
+
               private fun checkAlerts(rows: List<Row>, now: Long) {
                   val bad = ArrayList<String>()
                   val changes = ArrayList<String>()
@@ -1683,6 +1700,7 @@ jobs:
                           prev[k] = st
                           // paused / un-paused strategies never notify
                           if (old != null && st != "paused" && old != "paused") changes.add("${r.name.ifEmpty { r.id }}: ${r.status}")
+                          if (old != null && st == "liveentered" && !acct2) trigEntered(r.name)
                       }
                       val dur = now - (since[k] ?: now)
                       val trigger = when {
