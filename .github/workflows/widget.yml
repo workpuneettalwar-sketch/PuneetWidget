@@ -55,6 +55,8 @@ jobs:
               <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
               <uses-permission android:name="android.permission.VIBRATE"/>
               <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"/>
+              <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" android:maxSdkVersion="32"/>
+              <uses-permission android:name="android.permission.USE_EXACT_ALARM"/>
               <queries>
                   <intent>
                       <action android:name="android.intent.action.MAIN"/>
@@ -88,6 +90,10 @@ jobs:
                       android:process=":tt2" android:configChanges="orientation|screenSize|keyboardHidden"/>
                   <service android:name=".tt.TtListService" android:exported="false"
                       android:permission="android.permission.BIND_REMOTEVIEWS"/>
+                  <activity android:name=".TriggerActivity" android:exported="false" android:excludeFromRecents="true"
+                      android:taskAffinity="" android:label="Triggers &amp; reminders"
+                      android:theme="@android:style/Theme.DeviceDefault.Dialog" android:windowSoftInputMode="adjustResize"/>
+                  <receiver android:name=".ReminderReceiver" android:exported="false"/>
                   <activity android:name=".ManualActivity" android:exported="false" android:excludeFromRecents="true"
                       android:taskAffinity="" android:theme="@android:style/Theme.Translucent.NoTitleBar"/>
                   <receiver android:name=".WidgetProvider" android:exported="true">
@@ -1158,6 +1164,8 @@ jobs:
                   for (r in 1..4) rv.setViewVisibility(rowId(r), if (used[r]) View.VISIBLE else View.GONE)
                   rv.setOnClickPendingIntent(R.id.idxbtn, PendingIntent.getActivity(this, 4,
                       Intent(this, IndexActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK), PendingIntent.FLAG_IMMUTABLE))
+                  rv.setOnClickPendingIntent(R.id.trigbtn, PendingIntent.getActivity(this, 7,
+                      Intent(this, TriggerActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK), PendingIntent.FLAG_IMMUTABLE))
                   rv.setOnClickPendingIntent(R.id.chartbtn, PendingIntent.getActivity(this, 5,
                       Intent(this, ChartLaunch::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK), PendingIntent.FLAG_IMMUTABLE))
                   showLock(rv, Prefs.armed(this))
@@ -1316,7 +1324,10 @@ jobs:
           }
 
           class BootReceiver : BroadcastReceiver() {
-              override fun onReceive(c: Context, i: Intent) = WidgetProvider.start(c)
+              override fun onReceive(c: Context, i: Intent) {
+                  WidgetProvider.start(c)
+                  try { Trigs.rescheduleAll(c) } catch (_: Exception) {}
+              }
           }
           END_OF_FILE_X
 
@@ -2385,6 +2396,275 @@ jobs:
           })();
           END_OF_FILE_X
 
+          mkdir -p 'app/src/main/java/com/btcwidget'
+          cat > 'app/src/main/java/com/btcwidget/TriggerActivity.kt' <<'END_OF_FILE_X'
+          package com.btcwidget
+
+          import android.app.Activity
+          import android.app.AlarmManager
+          import android.app.AlertDialog
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.app.TimePickerDialog
+          import android.content.BroadcastReceiver
+          import android.content.Context
+          import android.content.Intent
+          import android.graphics.Color
+          import android.graphics.Typeface
+          import android.media.AudioManager
+          import android.media.ToneGenerator
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.text.InputType
+          import android.view.Gravity
+          import android.view.ViewGroup
+          import android.widget.ArrayAdapter
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.Spinner
+          import android.widget.TextView
+          import android.widget.Toast
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.net.HttpURLConnection
+          import java.net.URL
+          import java.text.SimpleDateFormat
+          import java.util.Calendar
+          import java.util.Date
+          import java.util.Locale
+
+          /** Placed price triggers and reminders, kept on the phone (pref "trigs"). */
+          object Trigs {
+              /** Strategy name -> settings key of its Enter link (the px link is made from it). */
+              val STRATS = listOf("Long" to "le", "Short" to "se", "Long 4H" to "l4e", "Short 4H" to "s4e")
+
+              fun load(c: Context): JSONArray = try { JSONArray(Prefs.str(c, "trigs").ifEmpty { "[]" }) } catch (_: Exception) { JSONArray() }
+              fun save(c: Context, a: JSONArray) { Prefs.sp(c).edit().putString("trigs", a.toString()).apply() }
+
+              /** Enter link "...&key=go&value=1" -> "...&key=px&value=<price>". Null if no usable link saved. */
+              fun pxLink(c: Context, enterKey: String, price: String): String? {
+                  val go = Prefs.str(c, "link_$enterKey").trim()
+                  if (!go.contains("key=go")) return null
+                  val base = go.replace(Regex("[?&]key=go(&value=[^&]*)?"), "")
+                  val sep = if (base.contains("?")) "&" else "?"
+                  return (if (base.contains("://")) base else "https://$base") + sep + "key=px&value=" + price
+              }
+
+              fun get(link: String): String = try {
+                  val c = URL(link).openConnection() as HttpURLConnection
+                  c.connectTimeout = 10000; c.readTimeout = 15000
+                  val code = c.responseCode
+                  val body = try { (if (code < 400) c.inputStream else c.errorStream)?.bufferedReader()?.use { it.readText() } ?: "" } catch (_: Exception) { "" }
+                  c.disconnect()
+                  if (code in 200..299) "OK" else "FAILED (HTTP $code) " + body.take(80)
+              } catch (e: Exception) { "FAILED: " + (e.message ?: e.javaClass.simpleName) }
+
+              private fun alarmPi(c: Context, id: Int, note: String): PendingIntent = PendingIntent.getBroadcast(c, 5000 + id,
+                  Intent(c, ReminderReceiver::class.java).putExtra("id", id).putExtra("note", note),
+                  PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+
+              fun schedule(c: Context, id: Int, at: Long, note: String) {
+                  val am = c.getSystemService(AlarmManager::class.java)
+                  val pi = alarmPi(c, id, note)
+                  val exact = Build.VERSION.SDK_INT < 31 || am.canScheduleExactAlarms()
+                  if (exact) {
+                      val show = PendingIntent.getActivity(c, 4999, Intent(c, TriggerActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
+                      am.setAlarmClock(AlarmManager.AlarmClockInfo(at, show), pi)
+                  } else am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, pi)
+              }
+
+              fun unschedule(c: Context, id: Int) = c.getSystemService(AlarmManager::class.java).cancel(alarmPi(c, id, ""))
+
+              /** After a reboot: put the reminders back (ones already past fire straight away). */
+              fun rescheduleAll(c: Context) {
+                  val a = load(c)
+                  for (i in 0 until a.length()) {
+                      val o = a.optJSONObject(i) ?: continue
+                      if (o.optString("t") == "rem") schedule(c, o.optInt("id"), maxOf(o.optLong("at"), System.currentTimeMillis() + 5000), o.optString("note"))
+                  }
+              }
+          }
+
+          /** Reminder time reached: notification + the same double beep as the TT alerts. */
+          class ReminderReceiver : BroadcastReceiver() {
+              override fun onReceive(c: Context, i: Intent) {
+                  val id = i.getIntExtra("id", 0)
+                  val note = i.getStringExtra("note").orEmpty().ifEmpty { "Reminder" }
+                  val nm = c.getSystemService(NotificationManager::class.java)
+                  val ch = NotificationChannel("alert", "Tradetron alerts", NotificationManager.IMPORTANCE_HIGH)
+                  ch.setSound(null, null); ch.enableVibration(true)
+                  nm.createNotificationChannel(ch)
+                  val open = PendingIntent.getActivity(c, 4998, Intent(c, TriggerActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK), PendingIntent.FLAG_IMMUTABLE)
+                  nm.notify(6000 + id, Notification.Builder(c, "alert")
+                      .setContentTitle("⏰ Reminder").setContentText(note)
+                      .setStyle(Notification.BigTextStyle().bigText(note))
+                      .setSmallIcon(android.R.drawable.ic_lock_idle_alarm)
+                      .setCategory(Notification.CATEGORY_ALARM).setAutoCancel(true).setContentIntent(open).build())
+                  // remove it from the list
+                  val a = Trigs.load(c); val out = JSONArray()
+                  for (k in 0 until a.length()) { val o = a.optJSONObject(k) ?: continue; if (!(o.optString("t") == "rem" && o.optInt("id") == id)) out.put(o) }
+                  Trigs.save(c, out)
+                  val done = goAsync()
+                  try {
+                      val tone = ToneGenerator(AudioManager.STREAM_ALARM, 100)
+                      tone.startTone(ToneGenerator.TONE_CDMA_HIGH_SS, 700)
+                      Handler(Looper.getMainLooper()).postDelayed({ tone.release(); done.finish() }, 1200)
+                  } catch (_: Exception) { done.finish() }
+              }
+          }
+
+          /** TRIG button: set / cancel price triggers on the 4 strategies, and add reminders. */
+          class TriggerActivity : Activity() {
+              private lateinit var list: LinearLayout
+              private var remAt = 0L
+              private val tf = SimpleDateFormat("HH:mm", Locale.US)
+              private val df = SimpleDateFormat("d MMM HH:mm", Locale.US)
+
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  title = "Triggers & reminders"
+                  val dp = resources.displayMetrics.density
+                  fun px(v: Int) = (v * dp).toInt()
+                  val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(px(16), px(8), px(16), px(12)) }
+                  fun head(t: String) = root.addView(TextView(this).apply { text = t; setTypeface(null, Typeface.BOLD); textSize = 15f; setPadding(0, px(12), 0, px(4)) })
+                  fun row() = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+
+                  // ---- price trigger ----
+                  head("PRICE TRIGGER (runs inside Tradetron)")
+                  val strat = Spinner(this)
+                  strat.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, Trigs.STRATS.map { it.first })
+                  root.addView(strat)
+                  val price = EditText(this).apply { hint = "Price, e.g. 91500"; inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL }
+                  root.addView(price)
+                  root.addView(TextView(this).apply {
+                      text = "Enters (1 lot, like one Enter press) when price touches this level, from either side. Stays set until it fires or you cancel. Lock must be ticked."
+                      textSize = 12f; setTextColor(Color.GRAY)
+                  })
+                  val r1 = row()
+                  r1.addView(Button(this).apply { text = "SET"; setOnClickListener { setTrigger(strat.selectedItemPosition, price.text.toString().trim()) } },
+                      LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                  r1.addView(Button(this).apply { text = "CANCEL"; setOnClickListener { cancelTrigger(strat.selectedItemPosition, true) } },
+                      LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                  root.addView(r1)
+
+                  // ---- reminder ----
+                  head("REMINDER (double beep)")
+                  val note = EditText(this).apply { hint = "Note, e.g. check BTC at R1" }
+                  root.addView(note)
+                  val r2 = row()
+                  val pick = Button(this).apply { text = "Pick time" }
+                  pick.setOnClickListener {
+                      val now = Calendar.getInstance()
+                      TimePickerDialog(this, { _, h, m ->
+                          val c = Calendar.getInstance(); c.set(Calendar.HOUR_OF_DAY, h); c.set(Calendar.MINUTE, m); c.set(Calendar.SECOND, 0); c.set(Calendar.MILLISECOND, 0)
+                          if (c.timeInMillis <= System.currentTimeMillis()) c.add(Calendar.DAY_OF_YEAR, 1)
+                          remAt = c.timeInMillis; pick.text = df.format(Date(remAt))
+                      }, now.get(Calendar.HOUR_OF_DAY), now.get(Calendar.MINUTE), true).show()
+                  }
+                  r2.addView(pick, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                  r2.addView(Button(this).apply { text = "ADD"; setOnClickListener {
+                      if (remAt <= System.currentTimeMillis()) { toast("Pick a time first"); return@setOnClickListener }
+                      val id = (System.currentTimeMillis() / 1000 % 100000).toInt()
+                      val n = note.text.toString().trim().ifEmpty { "Reminder" }
+                      val ctx = this@TriggerActivity
+                      val a = Trigs.load(ctx); a.put(JSONObject().put("t", "rem").put("id", id).put("at", remAt).put("note", n)); Trigs.save(ctx, a)
+                      Trigs.schedule(ctx, id, remAt, n)
+                      toast("Reminder set for " + df.format(Date(remAt)))
+                      note.setText(""); remAt = 0L; pick.text = "Pick time"; refresh()
+                  } }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                  root.addView(r2)
+
+                  // ---- placed ----
+                  head("PLACED")
+                  list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                  root.addView(list)
+                  root.addView(TextView(this).apply {
+                      text = "A trigger that has fired in Tradetron still shows here until you remove it (✕ also cancels it in Tradetron)."
+                      textSize = 12f; setTextColor(Color.GRAY); setPadding(0, px(6), 0, 0)
+                  })
+                  setContentView(ScrollView(this).apply { addView(root) })
+                  window.setLayout((resources.displayMetrics.widthPixels * 0.94).toInt(), ViewGroup.LayoutParams.WRAP_CONTENT)
+                  refresh()
+              }
+
+              private fun toast(s: String) = Toast.makeText(applicationContext, s, Toast.LENGTH_LONG).show()
+
+              private fun refresh() {
+                  list.removeAllViews()
+                  val a = Trigs.load(this)
+                  if (a.length() == 0) { list.addView(TextView(this).apply { text = "Nothing placed"; setTextColor(Color.GRAY) }); return }
+                  for (i in 0 until a.length()) {
+                      val o = a.optJSONObject(i) ?: continue
+                      val r = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+                      val txt = if (o.optString("t") == "px")
+                          "🎯 ${o.optString("s")} at ${o.optString("p")}  (set ${tf.format(Date(o.optLong("set")))})"
+                      else "⏰ ${df.format(Date(o.optLong("at")))}  ${o.optString("note")}"
+                      r.addView(TextView(this).apply { text = txt; textSize = 14f }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                      r.addView(Button(this).apply { text = "✕"; setOnClickListener {
+                          if (o.optString("t") == "px") cancelTrigger(Trigs.STRATS.indexOfFirst { it.first == o.optString("s") }, true)
+                          else { Trigs.unschedule(this@TriggerActivity, o.optInt("id")); remove { it.optString("t") == "rem" && it.optInt("id") == o.optInt("id") }; refresh() }
+                      } })
+                      list.addView(r)
+                  }
+              }
+
+              private fun remove(match: (JSONObject) -> Boolean) {
+                  val a = Trigs.load(this); val out = JSONArray()
+                  for (i in 0 until a.length()) { val o = a.optJSONObject(i) ?: continue; if (!match(o)) out.put(o) }
+                  Trigs.save(this, out)
+              }
+
+              private fun send(link: String, what: String, after: () -> Unit) {
+                  toast("Sending $what…")
+                  Thread {
+                      val res = Trigs.get(link)
+                      runOnUiThread {
+                          toast("$what: " + (if (res == "OK") "sent ✓" else res))
+                          if (res == "OK") after()
+                      }
+                  }.start()
+              }
+
+              private fun setTrigger(idx: Int, p: String) {
+                  if (idx < 0) return
+                  val (name, key) = Trigs.STRATS[idx]
+                  val v = p.toDoubleOrNull()
+                  if (v == null || v <= 0) { toast("Enter a price"); return }
+                  if (!Prefs.armed(this)) { toast("Locked: tick Lock on the widget first"); return }
+                  val ps = if (v % 1.0 == 0.0) v.toLong().toString() else v.toString()
+                  val link = Trigs.pxLink(this, key, ps) ?: run { toast("Add the $name Enter link in widget settings first"); return }
+                  val go = {
+                      send(link, "$name trigger at $ps") {
+                          remove { it.optString("t") == "px" && it.optString("s") == name }   // a new trigger replaces the old one
+                          val a = Trigs.load(this); a.put(JSONObject().put("t", "px").put("s", name).put("p", ps).put("set", System.currentTimeMillis())); Trigs.save(this, a)
+                          refresh()
+                      }
+                  }
+                  if (Prefs.sp(this).getBoolean("mconfirm", true))
+                      AlertDialog.Builder(this).setTitle("Set $name trigger at $ps?")
+                          .setMessage("$name will enter when BTC touches $ps.").setPositiveButton("SET") { _, _ -> go() }
+                          .setNegativeButton("Cancel", null).show()
+                  else go()
+              }
+
+              private fun cancelTrigger(idx: Int, ask: Boolean) {
+                  if (idx < 0) return
+                  val name = Trigs.STRATS[idx].first
+                  val link = Trigs.pxLink(this, Trigs.STRATS[idx].second, "0") ?: run { toast("Add the $name Enter link in widget settings first"); return }
+                  val go = { send(link, "$name trigger cancel") { remove { it.optString("t") == "px" && it.optString("s") == name }; refresh() } }
+                  if (ask) AlertDialog.Builder(this).setTitle("Cancel $name trigger?").setPositiveButton("YES") { _, _ -> go() }
+                      .setNegativeButton("No", null).show()
+                  else go()
+              }
+          }
+          END_OF_FILE_X
+
           mkdir -p 'app/src/main/res/drawable'
           cat > 'app/src/main/res/drawable/bg.xml' <<'END_OF_FILE_X'
           <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
@@ -2511,12 +2791,17 @@ jobs:
                                   android:text="TT" android:textColor="#FFFFFF" android:textSize="11sp" android:textStyle="bold"
                                   android:singleLine="true"/>
                           </LinearLayout>
-                          <FrameLayout android:layout_width="wrap_content" android:layout_height="0dp" android:layout_weight="1">
-                              <TextView android:id="@+id/idxbtn" android:layout_width="162dp" android:layout_height="wrap_content" android:layout_gravity="center_vertical"
+                          <LinearLayout android:layout_width="wrap_content" android:layout_height="0dp" android:layout_weight="1"
+                              android:orientation="horizontal" android:gravity="center_vertical">
+                              <TextView android:id="@+id/trigbtn" android:layout_width="79dp" android:layout_height="wrap_content"
+                                  android:gravity="center" android:paddingTop="4dp" android:paddingBottom="4dp" android:background="@drawable/purple_btn"
+                                  android:text="TRIG" android:textColor="#FFFFFF" android:textSize="11sp" android:textStyle="bold"
+                                  android:singleLine="true"/>
+                              <TextView android:id="@+id/idxbtn" android:layout_width="79dp" android:layout_height="wrap_content" android:layout_marginStart="4dp"
                                   android:gravity="center" android:paddingTop="4dp" android:paddingBottom="4dp" android:background="@drawable/purple_btn"
                                   android:text="INDICES" android:textColor="#FFFFFF" android:textSize="11sp" android:textStyle="bold"
                                   android:singleLine="true"/>
-                          </FrameLayout>
+                          </LinearLayout>
                       </LinearLayout>
                       <!-- right: Tradetron lines, prices, PnL, ADX -->
                       <LinearLayout android:layout_width="0dp" android:layout_weight="1" android:layout_height="match_parent"
