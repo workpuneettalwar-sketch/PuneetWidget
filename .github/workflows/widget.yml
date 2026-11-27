@@ -367,8 +367,8 @@ jobs:
                       "DOW" -> listOf("Yahoo" to { yahoo("^DJI") })
                       "CRUDE" -> listOf("Yahoo" to { yahoo("CL=F") })
                       "ETH" -> listOf("Delta" to { mark("ETHUSD") })
-                      "GOLD" -> listOf("bullions" to { bullion("24k") }, "calc" to { calcBullion("24k") })
-                      "SILVER" -> listOf("bullions" to { bullion("silver") }, "calc" to { calcBullion("silver") })
+                      "GOLD" -> listOf("bullions" to { bullion("24k") }, "bullions MCX" to { bullion("mcx") })
+                      "SILVER" -> listOf("bullions" to { bullion("silver") }, "bullions 999" to { bullion("silver999") })
                       "NIFTY" -> listOf("NSE" to { nseIdx("NIFTY 50") }, "Yahoo" to { yahoo("^NSEI") }, "Angel" to { indexPrice("nifty-50") })
                       "BANKNIFTY" -> listOf("NSE" to { nseIdx("NIFTY BANK") }, "Yahoo" to { yahoo("^NSEBANK") }, "Angel" to { indexPrice("nifty-bank") })
                       "MIDCAP" -> listOf("NSE" to { nseIdx("NIFTY MIDCAP 100") }, "Yahoo" to { yahoo("NIFTY_MIDCAP_100.NS") }, "Angel" to { indexPrice("nifty-midcap-100") })
@@ -441,21 +441,30 @@ jobs:
 
               private class BSpec(val label: Regex, val lo: Double, val hi: Double)
               private val bspecs = mapOf(
-                  "mcx" to BSpec(Regex("""Gold\W{1,6}India\W{1,4}MCX""", RegexOption.IGNORE_CASE), 30000.0, 1_000_000.0),
-                  "24k" to BSpec(Regex("""Gold\W{1,4}24\W{0,3}(?:Karat|K)""", RegexOption.IGNORE_CASE), 30000.0, 1_000_000.0),
-                  "22k" to BSpec(Regex("""Gold\W{1,4}22\W{0,3}(?:Karat|K)""", RegexOption.IGNORE_CASE), 30000.0, 1_000_000.0),
-                  "silver" to BSpec(Regex("""Silver\W{1,6}India\W{1,4}MCX""", RegexOption.IGNORE_CASE), 30000.0, 5_000_000.0)
+                  // labels on the new site (Nov 2026): "Gold · India commodity exchange · ₹ per 10 g", "Gold 24 Carat", "Silver 999"
+                  "mcx" to BSpec(Regex("""Gold\W{1,6}India\W{1,4}(?:MCX|commodity exchange)""", RegexOption.IGNORE_CASE), 30000.0, 1_000_000.0),
+                  "24k" to BSpec(Regex("""Gold\W{1,4}24\W{0,3}(?:Karat|Carat|K)""", RegexOption.IGNORE_CASE), 30000.0, 1_000_000.0),
+                  "22k" to BSpec(Regex("""Gold\W{1,4}22\W{0,3}(?:Karat|Carat|K)""", RegexOption.IGNORE_CASE), 30000.0, 1_000_000.0),
+                  "silver" to BSpec(Regex("""Silver\W{1,6}India\W{1,4}(?:MCX|commodity exchange)""", RegexOption.IGNORE_CASE), 30000.0, 5_000_000.0),
+                  "silver999" to BSpec(Regex("""Silver\W{1,4}999""", RegexOption.IGNORE_CASE), 30000.0, 5_000_000.0)
               )
 
               private fun bullionsText(): String {
                   val now = System.currentTimeMillis()
                   bPage?.let { if (now - it.first < 10_000) return it.second }
-                  val c = URL("https://bullions.co.in/").openConnection() as HttpURLConnection
-                  c.connectTimeout = 4000; c.readTimeout = 4000
-                  c.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36")
-                  c.setRequestProperty("Accept", "text/html")
-                  val html = c.inputStream.bufferedReader().readText()
-                  c.disconnect()
+                  var html = ""; var last: Exception? = null
+                  for (u in listOf("https://bullions.co.in/", "https://bullions.co.in/location/new-delhi/")) {
+                      try {
+                          val c = URL(u).openConnection() as HttpURLConnection
+                          c.connectTimeout = 5000; c.readTimeout = 6000
+                          c.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36")
+                          c.setRequestProperty("Accept", "text/html")
+                          html = c.inputStream.bufferedReader().readText()
+                          c.disconnect()
+                          if (Regex("(?i)Gold\\W{1,4}24").containsMatchIn(html)) break
+                      } catch (e: Exception) { last = e }
+                  }
+                  if (html.isEmpty()) throw last ?: Exception("bullions.co.in not reachable")
                   val text = html.replace(Regex("(?is)<(script|style)[^>]*>.*?</\\1>"), " ")
                       .replace(Regex("(?s)<[^>]+>"), " ")
                       .replace("&nbsp;", " ").replace("&#8377;", " ").replace("&amp;", "&")
@@ -972,6 +981,25 @@ jobs:
                   field("key", "Delta API key")
                   field("secret", "Delta API secret")
                   label("TRADE LINKS")
+                  root.addView(Button(this).apply {
+                      text = "Paste all links (copy the links file first)"
+                      setOnClickListener {
+                          val cm = getSystemService(android.content.ClipboardManager::class.java)
+                          val txt = cm?.primaryClip?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.coerceToText(this@SettingsActivity)?.toString().orEmpty()
+                          val names = linkedMapOf("Long 4H" to "l4", "Short 4H" to "s4", "Bull 15" to "u", "Bear 15" to "d",
+                              "Bull 4H" to "u4", "Bear 4H" to "d4", "Long" to "l", "Short" to "s")
+                          var n = 0
+                          val ed = sp.edit()
+                          for (line in txt.lines()) {
+                              val m = Regex("""^\s*(Long 4H|Short 4H|Bull 15|Bear 15|Bull 4H|Bear 4H|Long|Short)\s+(Enter|Exit)\s*[:=]\s*(https?://\S+)""", RegexOption.IGNORE_CASE).find(line) ?: continue
+                              val base = names.entries.first { it.key.equals(m.groupValues[1], true) }.value
+                              ed.putString("link_" + base + (if (m.groupValues[2].equals("Enter", true)) "e" else "x"), m.groupValues[3].trim()); n++
+                          }
+                          ed.apply()
+                          Toast.makeText(this@SettingsActivity, if (n == 0) "No links found in the copied text" else "$n links saved", Toast.LENGTH_LONG).show()
+                          if (n > 0) recreate()
+                      }
+                  })
                   field("link_le", "Long Enter")
                   field("link_lx", "Long Exit")
                   field("link_se", "Short Enter")
@@ -1715,7 +1743,8 @@ jobs:
                       var hit: org.json.JSONObject? = null
                       for (i in 0 until a.length()) {
                           val o = a.optJSONObject(i) ?: continue
-                          if (hit == null && o.optString("t") == "px" && norm(o.optString("s")) == norm(name)) hit = o else out.put(o)
+                          val tn = com.btcwidget.Trigs.TT_NAME[o.optString("s")] ?: o.optString("s")
+                          if (hit == null && o.optString("t") == "px" && norm(tn) == norm(name)) hit = o else out.put(o)
                       }
                       val h = hit ?: return
                       com.btcwidget.Trigs.save(this, out)
@@ -2491,7 +2520,11 @@ jobs:
           /** Placed price triggers and reminders, kept on the phone (pref "trigs"). */
           object Trigs {
               /** Strategy name -> settings key of its Enter link (the px link is made from it). */
-              val STRATS = listOf("Long" to "le", "Short" to "se", "Long 4H" to "l4e", "Short 4H" to "s4e")
+              val STRATS = listOf("Long" to "le", "Short" to "se", "Long 4H" to "l4e", "Short 4H" to "s4e",
+                  "Bull 15" to "ue", "Bear 15" to "de", "Bull 4H" to "u4e", "Bear 4H" to "d4e")
+              /** Name of each strategy in Tradetron (to spot when it enters). */
+              val TT_NAME = mapOf("Long" to "Long", "Short" to "Short", "Long 4H" to "Long_4H", "Short 4H" to "Short_4H",
+                  "Bull 15" to "Bull_15M", "Bear 15" to "Bear_15M", "Bull 4H" to "Bull_4H", "Bear 4H" to "Bear_4H")
 
               fun load(c: Context): JSONArray = try { JSONArray(Prefs.str(c, "trigs").ifEmpty { "[]" }) } catch (_: Exception) { JSONArray() }
               fun save(c: Context, a: JSONArray) { Prefs.sp(c).edit().putString("trigs", a.toString()).apply() }
