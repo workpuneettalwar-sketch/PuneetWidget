@@ -155,8 +155,10 @@ jobs:
 
           /** Gives the ":tt2" process (AT Tradetron account) its own WebView storage, so its login never mixes with the main one. */
           class App : Application() {
+              companion object { @Volatile var ctx: android.content.Context? = null }
               override fun onCreate() {
                   super.onCreate()
+                  ctx = applicationContext
                   if (Build.VERSION.SDK_INT >= 28) {
                       try { if (getProcessName().endsWith(":tt2")) WebView.setDataDirectorySuffix("tt2") } catch (_: Exception) {}
                   }
@@ -365,8 +367,8 @@ jobs:
                       "DOW" -> listOf("Yahoo" to { yahoo("^DJI") })
                       "CRUDE" -> listOf("Yahoo" to { yahoo("CL=F") })
                       "ETH" -> listOf("Delta" to { mark("ETHUSD") })
-                      "GOLD" -> listOf("bullions" to { bullion("24k") })
-                      "SILVER" -> listOf("bullions" to { bullion("silver") })
+                      "GOLD" -> listOf("bullions" to { bullion("24k") }, "calc" to { calcBullion("24k") })
+                      "SILVER" -> listOf("bullions" to { bullion("silver") }, "calc" to { calcBullion("silver") })
                       "NIFTY" -> listOf("NSE" to { nseIdx("NIFTY 50") }, "Yahoo" to { yahoo("^NSEI") }, "Angel" to { indexPrice("nifty-50") })
                       "BANKNIFTY" -> listOf("NSE" to { nseIdx("NIFTY BANK") }, "Yahoo" to { yahoo("^NSEBANK") }, "Angel" to { indexPrice("nifty-bank") })
                       "MIDCAP" -> listOf("NSE" to { nseIdx("NIFTY MIDCAP 100") }, "Yahoo" to { yahoo("NIFTY_MIDCAP_100.NS") }, "Angel" to { indexPrice("nifty-midcap-100") })
@@ -475,7 +477,42 @@ jobs:
 
               fun bullion(kind: String): Double {
                   val spec = bspecs[kind.lowercase()] ?: throw Exception("unknown bullions:$kind")
-                  return bullionsValue(bullionsText(), spec) ?: throw Exception("not found on bullions.co.in")
+                  val v = bullionsValue(bullionsText(), spec) ?: throw Exception("not found on bullions.co.in")
+                  learnRatio(kind.lowercase(), v)
+                  return v
+              }
+
+              // ---- backup for Gold / Silver in rupees: international price x USD-INR, times the Indian premium
+              // (import duty etc.). The premium is learned from bullions.co.in whenever it works (default 6 %).
+              private fun intl(kind: String): Pair<Double, Double?> {
+                  val silver = kind == "silver"
+                  tlPrev.set(null)
+                  val usd = try { mark(if (silver) "XAGUSD" else "XAUUSD") } catch (_: Exception) { tlPrev.set(null); yahoo(if (silver) "SI=F" else "GC=F") }
+                  val pUsd = tlPrev.get()
+                  val inr = yahoo("INR=X")
+                  val base = usd * inr / 31.1035 * (if (silver) 1000.0 else 10.0)
+                  return Pair(base, if (pUsd != null && pUsd > 0) base * pUsd / usd else null)
+              }
+
+              private val ratioAt = java.util.concurrent.ConcurrentHashMap<String, Long>()
+              private fun learnRatio(kind: String, v: Double) {
+                  if (kind != "24k" && kind != "silver") return
+                  val now = System.currentTimeMillis()
+                  if (now - (ratioAt[kind] ?: 0L) < 600_000) return
+                  ratioAt[kind] = now
+                  try {
+                      val keep = tlPrev.get()
+                      val r = v / intl(kind).first
+                      tlPrev.set(keep)
+                      if (r in 0.9..1.3) App.ctx?.let { Prefs.sp(it).edit().putFloat("bratio_$kind", r.toFloat()).apply() }
+                  } catch (_: Exception) {}
+              }
+
+              fun calcBullion(kind: String): Double {
+                  val (base, prev) = intl(kind)
+                  val r = App.ctx?.let { Prefs.sp(it).getFloat("bratio_$kind", 1.06f).toDouble() } ?: 1.06
+                  tlPrev.set(prev?.let { it * r })
+                  return base * r
               }
 
               /** For the "Test gold" button: what was read for each rate, plus the raw text near the label if it failed. */
@@ -710,10 +747,12 @@ jobs:
           import java.net.HttpURLConnection
           import java.net.URL
 
-          /** Behind the 8 manual buttons: sends the saved Tradetron API link for that button (after an optional confirm). */
+          /** Behind the 16 manual buttons: sends the saved Tradetron API link for that button (after an optional confirm). */
           class ManualActivity : Activity() {
               private val names = mapOf("le" to "LONG ENTER", "lx" to "LONG EXIT", "se" to "SHORT ENTER", "sx" to "SHORT EXIT",
-                  "l4e" to "LONG 4H ENTER", "l4x" to "LONG 4H EXIT", "s4e" to "SHORT 4H ENTER", "s4x" to "SHORT 4H EXIT")
+                  "l4e" to "LONG 4H ENTER", "l4x" to "LONG 4H EXIT", "s4e" to "SHORT 4H ENTER", "s4x" to "SHORT 4H EXIT",
+                  "ue" to "BULL 15 ENTER", "ux" to "BULL 15 EXIT", "de" to "BEAR 15 ENTER", "dx" to "BEAR 15 EXIT",
+                  "u4e" to "BULL 4H ENTER", "u4x" to "BULL 4H EXIT", "d4e" to "BEAR 4H ENTER", "d4x" to "BEAR 4H EXIT")
 
               override fun onCreate(b: Bundle?) {
                   super.onCreate(b)
@@ -941,6 +980,14 @@ jobs:
                   field("link_l4x", "Long 4H Exit")
                   field("link_s4e", "Short 4H Enter")
                   field("link_s4x", "Short 4H Exit")
+                  field("link_ue", "Bull 15 Enter")
+                  field("link_ux", "Bull 15 Exit")
+                  field("link_de", "Bear 15 Enter")
+                  field("link_dx", "Bear 15 Exit")
+                  field("link_u4e", "Bull 4H Enter")
+                  field("link_u4x", "Bull 4H Exit")
+                  field("link_d4e", "Bear 4H Enter")
+                  field("link_d4x", "Bear 4H Exit")
                   root.addView(CheckBox(this).apply {
                       text = "Ask \"Are you sure?\" before sending"
                       isChecked = sp.getBoolean("mconfirm", true)
@@ -2556,6 +2603,16 @@ jobs:
           /** TRIG button: set / cancel price triggers on the 4 strategies, and add reminders. */
           class TriggerActivity : Activity() {
               private lateinit var list: LinearLayout
+              private lateinit var lockV: TextView
+              private val lh = Handler(Looper.getMainLooper())
+              private val lockTick = object : Runnable { override fun run() { showLock(); lh.postDelayed(this, 250) } }
+              override fun onResume() { super.onResume(); lh.post(lockTick) }
+              override fun onPause() { lh.removeCallbacks(lockTick); super.onPause() }
+              private fun showLock() {
+                  val on = Prefs.armed(this)
+                  lockV.text = if (on) "☑ Lock  ${(Prefs.armedLeft(this) + 999) / 1000}s" else "☐ Lock"
+                  lockV.setTextColor(if (on) 0xFF1E8E3E.toInt() else Color.GRAY)
+              }
               private var remAt = 0L
               private val tf = SimpleDateFormat("HH:mm", Locale.US)
               private val df = SimpleDateFormat("d MMM HH:mm", Locale.US)
@@ -2568,6 +2625,11 @@ jobs:
                   val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(px(16), px(8), px(16), px(12)) }
                   fun head(t: String) = root.addView(TextView(this).apply { text = t; setTypeface(null, Typeface.BOLD); textSize = 15f; setPadding(0, px(12), 0, px(4)) })
                   fun row() = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+
+                  // ---- Lock (same 5-second auto-lock as the TRADE panel) ----
+                  lockV = TextView(this).apply { textSize = 18f; setTypeface(null, Typeface.BOLD); setPadding(0, px(4), 0, px(4)) }
+                  lockV.setOnClickListener { Prefs.setArmed(this, !Prefs.armed(this)); showLock() }
+                  root.addView(lockV)
 
                   // ---- price trigger ----
                   head("TRIGGER")
@@ -2685,6 +2747,7 @@ jobs:
                   val (name, key) = Trigs.STRATS[idx]
                   val v = p.toDoubleOrNull()
                   if (v == null || v <= 0) { toast("Enter a price"); return }
+                  if (!Prefs.armed(this)) { toast("Locked: tick Lock first"); return }
                   val ps = if (v % 1.0 == 0.0) v.toLong().toString() else v.toString()
                   val link = Trigs.pxLink(this, key, ps) ?: run { toast("Add the $name Enter link in widget settings first"); return }
                   val go = {
@@ -2736,8 +2799,12 @@ jobs:
               private val h = Handler(Looper.getMainLooper())
               private lateinit var lock: TextView
               private val statusViews = ArrayList<Pair<String, TextView>>()
-              private val rows = listOf(Triple("Long", "le", "lx"), Triple("Short", "se", "sx"),
-                  Triple("Long 4H", "l4e", "l4x"), Triple("Short 4H", "s4e", "s4x"))
+              /** name shown, Tradetron strategy name (for the status), Enter key, Exit key */
+              private data class Strat(val name: String, val tt: String, val e: String, val x: String)
+              private val rows = listOf<Strat>(Strat("Long", "Long", "le", "lx"), Strat("Short", "Short", "se", "sx"),
+                  Strat("Long 4H", "Long_4H", "l4e", "l4x"), Strat("Short 4H", "Short_4H", "s4e", "s4x"),
+                  Strat("Bull 15", "Bull_15M", "ue", "ux"), Strat("Bear 15", "Bear_15M", "de", "dx"),
+                  Strat("Bull 4H", "Bull_4H", "u4e", "u4x"), Strat("Bear 4H", "Bear_4H", "d4e", "d4x"))
 
               override fun onCreate(b: Bundle?) {
                   super.onCreate(b)
@@ -2754,12 +2821,12 @@ jobs:
                   }
                   root.addView(lock)
 
-                  for ((name, ek, xk) in rows) {
+                  for ((name, tt, ek, xk) in rows) {
                       val r = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL; setPadding(0, px(5), 0, px(5)) }
                       val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
                       col.addView(TextView(this).apply { text = name; textSize = 16f; setTypeface(null, Typeface.BOLD) })
                       val st = TextView(this).apply { textSize = 12f; setTextColor(Color.GRAY) }
-                      col.addView(st); statusViews.add(name to st)
+                      col.addView(st); statusViews.add(tt to st)
                       r.addView(col, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
                       fun btn(t: String, c: Int, k: String) = TextView(this).apply {
                           text = t; textSize = 14f; setTypeface(null, Typeface.BOLD); setTextColor(Color.WHITE); gravity = Gravity.CENTER
@@ -2770,7 +2837,7 @@ jobs:
                       r.addView(btn("Exit", 0xFFC62828.toInt(), xk), LinearLayout.LayoutParams(px(76), ViewGroup.LayoutParams.WRAP_CONTENT).apply { marginStart = px(6) })
                       root.addView(r)
                   }
-                  setContentView(root)
+                  setContentView(android.widget.ScrollView(this).apply { addView(root) })
                   window.setLayout((resources.displayMetrics.widthPixels * 0.94).toInt(), ViewGroup.LayoutParams.WRAP_CONTENT)
               }
 
