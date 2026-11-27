@@ -93,6 +93,9 @@ jobs:
                   <activity android:name=".TriggerActivity" android:exported="false" android:excludeFromRecents="true"
                       android:taskAffinity="" android:label="Triggers &amp; reminders"
                       android:theme="@android:style/Theme.DeviceDefault.Dialog" android:windowSoftInputMode="adjustResize"/>
+                  <activity android:name=".TradeActivity" android:exported="false" android:excludeFromRecents="true"
+                      android:taskAffinity="" android:label="Trade"
+                      android:theme="@android:style/Theme.DeviceDefault.Dialog"/>
                   <receiver android:name=".ReminderReceiver" android:exported="false"/>
                   <activity android:name=".ManualActivity" android:exported="false" android:excludeFromRecents="true"
                       android:taskAffinity="" android:theme="@android:style/Theme.Translucent.NoTitleBar"/>
@@ -762,7 +765,12 @@ jobs:
               const val ACTION_CYCLE = "com.btcwidget.CYCLE"
               const val ACTION_LOCK = "com.btcwidget.LOCK"
               /** true when the Lock box is ticked = the 4 trade buttons are allowed to send. */
-              fun armed(c: Context) = sp(c).getBoolean("armed", false)
+              /** Trade buttons work only for 5 seconds after Lock is ticked in the TRADE panel, then it locks itself again. */
+              const val UNLOCK_MS = 5000L
+              fun armed(c: Context) = sp(c).getBoolean("armed", false) && System.currentTimeMillis() - sp(c).getLong("armedAt", 0L) in 0..UNLOCK_MS
+              fun armedLeft(c: Context): Long = if (!sp(c).getBoolean("armed", false)) 0L
+                  else (UNLOCK_MS - (System.currentTimeMillis() - sp(c).getLong("armedAt", 0L))).coerceAtLeast(0L)
+              fun setArmed(c: Context, on: Boolean) { sp(c).edit().putBoolean("armed", on).putLong("armedAt", System.currentTimeMillis()).apply() }
               val TFS = listOf("1m", "3m", "5m", "15m", "30m", "1h", "4h")
               val SLOT_KEYS = listOf("tvpkg", "dpkg", "tpkg") + (4..12).map { "app$it" }
 
@@ -905,12 +913,12 @@ jobs:
                       })
                   }
                   root.addView(Button(this).apply {
-                      text = "Tradetron status: log in, alerts, text size of TT lines"
+                      text = "Tradetron status"
                       setOnClickListener { startActivity(Intent(this@SettingsActivity, com.btcwidget.tt.TtSettingsActivity::class.java)) }
                   })
-                  seek("Widget transparency (left = clear, right = solid)", 255, Prefs.alpha(this)) {
+                  seek("Transparency", 255, Prefs.alpha(this)) {
                       sp.edit().putInt("alpha", it).apply() }
-                  seek("Text size for prices, PnL, Pos and ADX (11-20)", 9, Prefs.tsize(this) - 11) {
+                  seek("Text size", 9, Prefs.tsize(this) - 11) {
                       sp.edit().putInt("tsize", it + 11).apply() }
 
                   fun field(k: String, hint: String) {
@@ -920,33 +928,33 @@ jobs:
                           doAfterTextChanged { sp.edit().putString(k, it.toString().trim()).apply() }
                       })
                   }
-                  field("relay", "Relay URL (fixed-IP server), e.g. https://1-2-3-4.sslip.io")
+                  field("relay", "Relay URL")
                   field("rtoken", "Relay token")
-                  field("key", "Delta API key (read-only; optional backup if relay is down)")
-                  field("secret", "Delta API secret (optional backup)")
-                  label("MANUAL TRADE BUTTONS (left side of the widget). Paste each Tradetron API link:")
-                  field("link_le", "Long: Enter link")
-                  field("link_lx", "Long: Exit link")
-                  field("link_se", "Short: Enter link")
-                  field("link_sx", "Short: Exit link")
-                  field("link_l4e", "Long 4H: Enter link")
-                  field("link_l4x", "Long 4H: Exit link")
-                  field("link_s4e", "Short 4H: Enter link")
-                  field("link_s4x", "Short 4H: Exit link")
+                  field("key", "Delta API key")
+                  field("secret", "Delta API secret")
+                  label("TRADE LINKS")
+                  field("link_le", "Long Enter")
+                  field("link_lx", "Long Exit")
+                  field("link_se", "Short Enter")
+                  field("link_sx", "Short Exit")
+                  field("link_l4e", "Long 4H Enter")
+                  field("link_l4x", "Long 4H Exit")
+                  field("link_s4e", "Short 4H Enter")
+                  field("link_s4x", "Short 4H Exit")
                   root.addView(CheckBox(this).apply {
-                      text = "Ask \"Are you sure?\" before sending (protects against accidental taps)"
+                      text = "Ask \"Are you sure?\" before sending"
                       isChecked = sp.getBoolean("mconfirm", true)
                       setOnCheckedChangeListener { _, v -> sp.edit().putBoolean("mconfirm", v).apply() }
                   })
-                  field("stratlink", "STRATEGIES button link: paste the link to open (e.g. your Tradetron deployed strategies page)")
-                  field("chartlink", "CHART button link: paste the link of the chart you want (e.g. a TradingView or Delta chart link)")
-                  field("pnlsrc", "PnL source: blank = widget calculation (recommended). Type delta to use Delta's own field (known to be wrong for options)")
-                  field("fee", "Fee per open position in rupees, subtracted from PnL. Try 12. Blank = none")
-                  field("rate", "USD-to-INR rate for PnL (blank = 85, Delta's fixed rate; type usd to show dollars)")
-                  field("tfs", "ADX timeframes, comma-separated (blank = 5m,15m,1h; options 1m,3m,5m,15m,30m,1h,4h)")
+                  field("stratlink", "TT button link")
+                  field("chartlink", "CHART button link")
+                  field("pnlsrc", "PnL source (blank or delta)")
+                  field("fee", "Fee per position (₹)")
+                  field("rate", "USD-INR rate (blank = 85, usd = $)")
+                  field("tfs", "ADX timeframes (blank = 5m,15m,1h)")
 
                   root.addView(Button(this).apply {
-                      text = "Test PnL (shows raw Delta numbers)"
+                      text = "Test PnL"
                       setOnClickListener {
                           val relay = Prefs.str(this@SettingsActivity, "relay"); val tok = Prefs.str(this@SettingsActivity, "rtoken")
                           val key = Prefs.str(this@SettingsActivity, "key"); val sec = Prefs.str(this@SettingsActivity, "secret")
@@ -965,7 +973,7 @@ jobs:
                       }
                   })
                   root.addView(Button(this).apply {
-                      text = "Test gold (bullions.co.in)"
+                      text = "Test gold"
                       setOnClickListener {
                           Toast.makeText(this@SettingsActivity, "Fetching...", Toast.LENGTH_SHORT).show()
                           Thread {
@@ -978,7 +986,7 @@ jobs:
                       }
                   })
                   root.addView(Button(this).apply {
-                      text = "Test prices (shows each source)"
+                      text = "Test prices"
                       setOnClickListener {
                           Toast.makeText(this@SettingsActivity, "Fetching...", Toast.LENGTH_SHORT).show()
                           Thread {
@@ -1011,23 +1019,23 @@ jobs:
                       }
                       root.addView(btn)
                   }
-                  label("Widget buttons: 6 per row, 2 rows. Pick any installed app for each.")
+                  label("APP BUTTONS")
                   Prefs.migrateSlots(this)
                   Prefs.SLOT_KEYS.forEachIndexed { i, k -> pick(k, i + 1) }
 
                   // ---------------- Secure Folder account (2nd Delta account) ----------------
                   root.addView(TextView(this).apply {
-                      text = "SECURE FOLDER ACCOUNT (2nd Delta account)"; textSize = 18f
+                      text = "2ND ACCOUNT"; textSize = 18f
                       setTypeface(typeface, android.graphics.Typeface.BOLD); setPadding(0, 64, 0, 0)
                   })
-                  field("key2", "2nd account Delta API key (read-only key is enough)")
-                  field("secret2", "2nd account Delta API secret")
-                  field("relay2", "2nd account relay URL (optional; must be set up for the 2nd account's key)")
-                  field("rtoken2", "2nd account relay token (optional)")
-                  field("pnlsrc2", "2nd account PnL source: blank = widget calculation (recommended); type delta for Delta's own field")
-                  field("fee2", "2nd account fee per open position in rupees. Blank = none")
+                  field("key2", "Delta API key")
+                  field("secret2", "Delta API secret")
+                  field("relay2", "Relay URL")
+                  field("rtoken2", "Relay token")
+                  field("pnlsrc2", "PnL source (blank or delta)")
+                  field("fee2", "Fee per position (₹)")
                   root.addView(Button(this).apply {
-                      text = "Test PnL of 2nd account"
+                      text = "Test PnL"
                       setOnClickListener {
                           val rate = Prefs.rate(this@SettingsActivity)
                           val c = this@SettingsActivity
@@ -1077,11 +1085,6 @@ jobs:
 
           class UpdateService : Service() {
               companion object {
-                  /** Lock tick box: ticked (green) = trade buttons work; empty (grey) = buttons do nothing. */
-                  fun showLock(rv: RemoteViews, on: Boolean) {
-                      rv.setTextViewText(R.id.mlock, if (on) "☑ Lock" else "☐ Lock")
-                      rv.setTextColor(R.id.mlock, if (on) 0xFF4CD964.toInt() else 0xFFAAAAAA.toInt())
-                  }
               }
 
               private val pool = Executors.newFixedThreadPool(16)
@@ -1168,16 +1171,8 @@ jobs:
                       Intent(this, TriggerActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK), PendingIntent.FLAG_IMMUTABLE))
                   rv.setOnClickPendingIntent(R.id.chartbtn, PendingIntent.getActivity(this, 5,
                       Intent(this, ChartLaunch::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK), PendingIntent.FLAG_IMMUTABLE))
-                  showLock(rv, Prefs.armed(this))
-                  rv.setOnClickPendingIntent(R.id.mlock, PendingIntent.getBroadcast(this, 30,
-                      Intent(this, WidgetProvider::class.java).setAction(Prefs.ACTION_LOCK),
-                      PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT))
-                  for ((i, pair) in listOf(R.id.mle to "le", R.id.mlx to "lx", R.id.mse to "se", R.id.msx to "sx",
-                          R.id.ml4e to "l4e", R.id.ml4x to "l4x", R.id.ms4e to "s4e", R.id.ms4x to "s4x").withIndex()) {
-                      rv.setOnClickPendingIntent(pair.first, PendingIntent.getActivity(this, 40 + i,
-                          Intent(this, ManualActivity::class.java).putExtra("k", pair.second).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
-                          PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT))
-                  }
+                  rv.setOnClickPendingIntent(R.id.tradebtn, PendingIntent.getActivity(this, 8,
+                      Intent(this, TradeActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK), PendingIntent.FLAG_IMMUTABLE))
                   rv.setOnClickPendingIntent(R.id.stratbtn, PendingIntent.getActivity(this, 6,
                       Intent(this, ChartLaunch::class.java).putExtra("k", "stratlink").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK), PendingIntent.FLAG_IMMUTABLE))
                   AppWidgetManager.getInstance(this).updateAppWidget(ids(), rv)
@@ -1302,14 +1297,6 @@ jobs:
 
               override fun onReceive(c: Context, i: Intent) {
                   super.onReceive(c, i)
-                  if (i.action == Prefs.ACTION_LOCK) {
-                      val on = !Prefs.armed(c)
-                      Prefs.sp(c).edit().putBoolean("armed", on).apply()
-                      val m = AppWidgetManager.getInstance(c)
-                      val rv = android.widget.RemoteViews(c.packageName, R.layout.widget)
-                      UpdateService.showLock(rv, on)
-                      m.partiallyUpdateAppWidget(m.getAppWidgetIds(android.content.ComponentName(c, WidgetProvider::class.java)), rv)
-                  }
                   if (i.action == Prefs.ACTION_CYCLE) {
                       val next = Prefs.TFS[(Prefs.TFS.indexOf(Prefs.tf(c)) + 1) % Prefs.TFS.size]
                       Prefs.sp(c).edit().putString("tf", next).apply()
@@ -2100,38 +2087,34 @@ jobs:
                   status = TextView(this).apply { textSize = 14f; setPadding(dp(10), dp(10), dp(10), dp(10)); setBackgroundColor(0xFFECEFF1.toInt()) }
                   col.addView(status)
 
-                  label("1. Log in once (use email/mobile + password or OTP; Google sign-in may be blocked inside apps).")
                   button("Log in to Tradetron") { startActivity(Intent(this, WebActivity::class.java).putExtra("url", Prefs.LOGIN)) }
-                  button("Open Tradetron dashboard here (pause / exit / fix)") {
+                  button("Open Tradetron dashboard") {
                       startActivity(Intent(this, WebActivity::class.java).putExtra("url", Prefs.DASH))
                   }
                   button("Reload now") { TtService.start(this, TtService.ACT_RELOAD) }
 
-                  label("AT Account (2nd Tradetron account, e.g. the one in Secure Folder)", 16f)
-                  switch("Show AT account in the widget (scroll down the Tradetron list)", "acct2", false)
+                  label("AT account", 16f)
+                  switch("Show AT account", "acct2", false)
                   button("Log in to AT account") { startActivity(Intent(this, WebActivity2::class.java).putExtra("url", Prefs.LOGIN)) }
                   button("Open AT dashboard here") { startActivity(Intent(this, WebActivity2::class.java).putExtra("url", Prefs.DASH)) }
 
-                  label("Check status every (seconds)")
+                  label("Check every (seconds)")
                   interval = number("interval", 5)
-                  label("Reload the dashboard page every (seconds) - used only while reading the page directly")
+                  label("Reload page every (seconds)")
                   reload = number("reload", 30)
                   button("Save timings") { saveNumbers(); Toast.makeText(this, "Saved", Toast.LENGTH_SHORT).show() }
 
                   label("Alerts", 16f)
-                  switch("Alerts on errors / blocked / stuck / logged out", "alerts", true)
-                  switch("Double beep (once) for those alerts", "alarm", true)
-                  switch("Soft notification on every status change (entries / exits)", "changeBeep", false)
+                  switch("Alerts on errors", "alerts", true)
+                  switch("Double beep", "alarm", true)
+                  switch("Notify every status change", "changeBeep", false)
                   button("Test alert") { TtService.start(this, TtService.ACT_TEST) }
-                  button("Allow running in background (battery)") { askBattery() }
+                  button("Allow background (battery)") { askBattery() }
 
                   label("Widget", 16f)
-                  seek("Text size of the Tradetron lines", "tsize", 13, 9, 22)
-                  appBtn = button("") { pickApp() }
-                  updateAppBtn()
+                  seek("TT text size", "tsize", 13, 9, 22)
 
-                  label("Help", 16f)
-                  button("Copy diagnostics (send to Claude if statuses look wrong)") { copyDiag() }
+                  button("Copy diagnostics") { copyDiag() }
 
                   setContentView(ScrollView(this).apply { addView(col) })
                   h.post(tickUi)
@@ -2579,7 +2562,7 @@ jobs:
 
               override fun onCreate(b: Bundle?) {
                   super.onCreate(b)
-                  title = "Triggers & reminders"
+                  title = "TRIG"
                   val dp = resources.displayMetrics.density
                   fun px(v: Int) = (v * dp).toInt()
                   val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(px(16), px(8), px(16), px(12)) }
@@ -2587,16 +2570,12 @@ jobs:
                   fun row() = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
 
                   // ---- price trigger ----
-                  head("PRICE TRIGGER (runs inside Tradetron)")
+                  head("TRIGGER")
                   val strat = Spinner(this)
                   strat.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, Trigs.STRATS.map { it.first })
                   root.addView(strat)
-                  val price = EditText(this).apply { hint = "Price, e.g. 91500"; inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL }
+                  val price = EditText(this).apply { hint = "Price"; inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL }
                   root.addView(price)
-                  root.addView(TextView(this).apply {
-                      text = "Enters (1 lot, like one Enter press) when price touches this level, from either side. Stays set until it fires or you cancel. Lock must be ticked."
-                      textSize = 12f; setTextColor(Color.GRAY)
-                  })
                   val r1 = row()
                   r1.addView(Button(this).apply { text = "SET"; setOnClickListener { setTrigger(strat.selectedItemPosition, price.text.toString().trim()) } },
                       LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
@@ -2605,14 +2584,11 @@ jobs:
                   root.addView(r1)
 
                   // ---- price alert (beep only) ----
-                  head("PRICE ALERT (beep only, no trade)")
-                  val ap = EditText(this).apply { hint = "BTC price, e.g. 92000"; inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL }
+                  head("ALERT")
+                  val ap = EditText(this).apply { hint = if (Trigs.lastPrice > 0) String.format(Locale.US, "Price (now %,.0f)", Trigs.lastPrice) else "Price"; inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL }
                   root.addView(ap)
-                  val an = EditText(this).apply { hint = "Note (optional)" }
+                  val an = EditText(this).apply { hint = "Note" }
                   root.addView(an)
-                  if (Trigs.lastPrice > 0) root.addView(TextView(this).apply {
-                      text = String.format(Locale.US, "BTC now: %,.1f. Beeps once when price touches your level, from either side.", Trigs.lastPrice)
-                      textSize = 12f; setTextColor(Color.GRAY) })
                   root.addView(Button(this).apply { text = "ADD ALERT"; setOnClickListener {
                       val v = ap.text.toString().trim().toDoubleOrNull()
                       if (v == null || v <= 0) { toast("Enter a price"); return@setOnClickListener }
@@ -2627,8 +2603,8 @@ jobs:
                   } })
 
                   // ---- reminder ----
-                  head("REMINDER (double beep)")
-                  val note = EditText(this).apply { hint = "Note, e.g. check BTC at R1" }
+                  head("REMINDER")
+                  val note = EditText(this).apply { hint = "Note" }
                   root.addView(note)
                   val r2 = row()
                   val pick = Button(this).apply { text = "Pick time" }
@@ -2657,10 +2633,6 @@ jobs:
                   head("PLACED")
                   list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
                   root.addView(list)
-                  root.addView(TextView(this).apply {
-                      text = "A trigger that has fired in Tradetron still shows here until you remove it (✕ also cancels it in Tradetron)."
-                      textSize = 12f; setTextColor(Color.GRAY); setPadding(0, px(6), 0, 0)
-                  })
                   setContentView(ScrollView(this).apply { addView(root) })
                   window.setLayout((resources.displayMetrics.widthPixels * 0.94).toInt(), ViewGroup.LayoutParams.WRAP_CONTENT)
                   refresh()
@@ -2713,7 +2685,6 @@ jobs:
                   val (name, key) = Trigs.STRATS[idx]
                   val v = p.toDoubleOrNull()
                   if (v == null || v <= 0) { toast("Enter a price"); return }
-                  if (!Prefs.armed(this)) { toast("Locked: tick Lock on the widget first"); return }
                   val ps = if (v % 1.0 == 0.0) v.toLong().toString() else v.toString()
                   val link = Trigs.pxLink(this, key, ps) ?: run { toast("Add the $name Enter link in widget settings first"); return }
                   val go = {
@@ -2739,6 +2710,105 @@ jobs:
                       .setNegativeButton("No", null).show()
                   else go()
               }
+          }
+          END_OF_FILE_X
+
+          mkdir -p 'app/src/main/java/com/btcwidget'
+          cat > 'app/src/main/java/com/btcwidget/TradeActivity.kt' <<'END_OF_FILE_X'
+          package com.btcwidget
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.graphics.Color
+          import android.graphics.Typeface
+          import android.graphics.drawable.GradientDrawable
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.view.Gravity
+          import android.view.ViewGroup
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import android.widget.Toast
+
+          /** TRADE button: Lock on top, then Long / Short / Long 4H / Short 4H with their Tradetron status and Enter / Exit. */
+          class TradeActivity : Activity() {
+              private val h = Handler(Looper.getMainLooper())
+              private lateinit var lock: TextView
+              private val statusViews = ArrayList<Pair<String, TextView>>()
+              private val rows = listOf(Triple("Long", "le", "lx"), Triple("Short", "se", "sx"),
+                  Triple("Long 4H", "l4e", "l4x"), Triple("Short 4H", "s4e", "s4x"))
+
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  title = "TRADE"
+                  val dp = resources.displayMetrics.density
+                  fun px(v: Int) = (v * dp).toInt()
+                  fun bg(c: Int) = GradientDrawable().apply { setColor(c); cornerRadius = px(6).toFloat() }
+                  val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(px(14), px(6), px(14), px(14)) }
+
+                  lock = TextView(this).apply { textSize = 18f; setTypeface(null, Typeface.BOLD); setPadding(0, px(4), 0, px(10)) }
+                  lock.setOnClickListener {
+                      Prefs.setArmed(this, !Prefs.armed(this))
+                      showLock()
+                  }
+                  root.addView(lock)
+
+                  for ((name, ek, xk) in rows) {
+                      val r = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL; setPadding(0, px(5), 0, px(5)) }
+                      val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                      col.addView(TextView(this).apply { text = name; textSize = 16f; setTypeface(null, Typeface.BOLD) })
+                      val st = TextView(this).apply { textSize = 12f; setTextColor(Color.GRAY) }
+                      col.addView(st); statusViews.add(name to st)
+                      r.addView(col, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                      fun btn(t: String, c: Int, k: String) = TextView(this).apply {
+                          text = t; textSize = 14f; setTypeface(null, Typeface.BOLD); setTextColor(Color.WHITE); gravity = Gravity.CENTER
+                          background = bg(c); setPadding(0, px(10), 0, px(10))
+                          setOnClickListener { trade(k) }
+                      }
+                      r.addView(btn("Enter", 0xFF1E8E3E.toInt(), ek), LinearLayout.LayoutParams(px(76), ViewGroup.LayoutParams.WRAP_CONTENT).apply { marginStart = px(6) })
+                      r.addView(btn("Exit", 0xFFC62828.toInt(), xk), LinearLayout.LayoutParams(px(76), ViewGroup.LayoutParams.WRAP_CONTENT).apply { marginStart = px(6) })
+                      root.addView(r)
+                  }
+                  setContentView(root)
+                  window.setLayout((resources.displayMetrics.widthPixels * 0.94).toInt(), ViewGroup.LayoutParams.WRAP_CONTENT)
+              }
+
+              /** Ticked = buttons work, for 5 seconds; then it locks itself again. */
+              private fun showLock() {
+                  val left = Prefs.armedLeft(this)
+                  val on = Prefs.armed(this)
+                  lock.text = if (on) "☑ Lock  ${(left + 999) / 1000}s" else "☐ Lock"
+                  lock.setTextColor(if (on) 0xFF1E8E3E.toInt() else Color.GRAY)
+              }
+
+              private fun trade(k: String) {
+                  if (!Prefs.armed(this)) { Toast.makeText(applicationContext, "Locked: tick Lock first", Toast.LENGTH_SHORT).show(); return }
+                  startActivity(Intent(this, ManualActivity::class.java).putExtra("k", k))
+              }
+
+              /** Status of each strategy from the PT list the widget already reads (e.g. Live-Entered, Active). */
+              private val tick = object : Runnable {
+                  override fun run() {
+                      showLock()
+                      val norm = { x: String -> x.lowercase().replace(Regex("[^a-z0-9]"), "") }
+                      val all = com.btcwidget.tt.State.rows
+                      for ((name, v) in statusViews) {
+                          val row = all.firstOrNull { norm(it.name) == norm(name) }
+                          v.text = row?.status?.ifEmpty { "--" } ?: "--"
+                          val s = norm(v.text.toString())
+                          v.setTextColor(when {
+                              s.contains("liveentered") -> 0xFF1E8E3E.toInt()
+                              s.contains("error") || s.contains("block") -> 0xFFC62828.toInt()
+                              else -> Color.GRAY
+                          })
+                      }
+                      h.postDelayed(this, 250)
+                  }
+              }
+
+              override fun onResume() { super.onResume(); h.post(tick) }
+              override fun onPause() { h.removeCallbacks(tick); super.onPause() }
           }
           END_OF_FILE_X
 
@@ -2796,89 +2866,39 @@ jobs:
                   android:orientation="vertical" android:padding="8dp">
                   <LinearLayout android:layout_width="match_parent" android:layout_height="0dp" android:layout_weight="1"
                       android:orientation="horizontal">
-                      <!-- left: Lock, 4 strategy rows (name + Enter + Exit), CHART + TT, INDICES; spread evenly down to the app icons -->
+                      <!-- left: CHART, TT, TRIG, TRADE, INDICES; spread evenly down to the app icons -->
                       <LinearLayout android:layout_width="wrap_content" android:layout_height="match_parent"
                           android:orientation="vertical" android:layout_marginEnd="10dp">
                           <FrameLayout android:layout_width="wrap_content" android:layout_height="0dp" android:layout_weight="1">
-                              <TextView android:id="@+id/mlock" android:layout_width="66dp" android:layout_height="wrap_content"
-                                  android:layout_gravity="center_vertical"
-                                  android:text="☐ Lock" android:textColor="#FFFFFF" android:textSize="14sp" android:textStyle="bold"
-                                  android:singleLine="true"/>
-                          </FrameLayout>
-                          <LinearLayout android:layout_width="wrap_content" android:layout_height="0dp" android:layout_weight="1"
-                              android:orientation="horizontal" android:gravity="center_vertical">
-                              <TextView android:layout_width="66dp" android:layout_height="wrap_content" android:text="Long"
-                                  android:textColor="#FFFFFF" android:textSize="13sp" android:textStyle="bold" android:singleLine="true"/>
-                              <TextView android:id="@+id/mle" android:layout_width="46dp" android:layout_height="wrap_content"
-                                  android:gravity="center" android:paddingTop="4dp" android:paddingBottom="4dp" android:background="@drawable/idx_btn"
-                                  android:text="Enter" android:textColor="#FFFFFF" android:textSize="11sp" android:textStyle="bold"
-                                  android:singleLine="true"/>
-                              <TextView android:id="@+id/mlx" android:layout_width="46dp" android:layout_height="wrap_content" android:layout_marginStart="4dp"
-                                  android:gravity="center" android:paddingTop="4dp" android:paddingBottom="4dp" android:background="@drawable/red_btn"
-                                  android:text="Exit" android:textColor="#FFFFFF" android:textSize="11sp" android:textStyle="bold"
-                                  android:singleLine="true"/>
-                          </LinearLayout>
-                          <LinearLayout android:layout_width="wrap_content" android:layout_height="0dp" android:layout_weight="1"
-                              android:orientation="horizontal" android:gravity="center_vertical">
-                              <TextView android:layout_width="66dp" android:layout_height="wrap_content" android:text="Short"
-                                  android:textColor="#FFFFFF" android:textSize="13sp" android:textStyle="bold" android:singleLine="true"/>
-                              <TextView android:id="@+id/mse" android:layout_width="46dp" android:layout_height="wrap_content"
-                                  android:gravity="center" android:paddingTop="4dp" android:paddingBottom="4dp" android:background="@drawable/idx_btn"
-                                  android:text="Enter" android:textColor="#FFFFFF" android:textSize="11sp" android:textStyle="bold"
-                                  android:singleLine="true"/>
-                              <TextView android:id="@+id/msx" android:layout_width="46dp" android:layout_height="wrap_content" android:layout_marginStart="4dp"
-                                  android:gravity="center" android:paddingTop="4dp" android:paddingBottom="4dp" android:background="@drawable/red_btn"
-                                  android:text="Exit" android:textColor="#FFFFFF" android:textSize="11sp" android:textStyle="bold"
-                                  android:singleLine="true"/>
-                          </LinearLayout>
-                          <LinearLayout android:layout_width="wrap_content" android:layout_height="0dp" android:layout_weight="1"
-                              android:orientation="horizontal" android:gravity="center_vertical">
-                              <TextView android:layout_width="66dp" android:layout_height="wrap_content" android:text="Long 4H"
-                                  android:textColor="#FFFFFF" android:textSize="13sp" android:textStyle="bold" android:singleLine="true"/>
-                              <TextView android:id="@+id/ml4e" android:layout_width="46dp" android:layout_height="wrap_content"
-                                  android:gravity="center" android:paddingTop="4dp" android:paddingBottom="4dp" android:background="@drawable/idx_btn"
-                                  android:text="Enter" android:textColor="#FFFFFF" android:textSize="11sp" android:textStyle="bold"
-                                  android:singleLine="true"/>
-                              <TextView android:id="@+id/ml4x" android:layout_width="46dp" android:layout_height="wrap_content" android:layout_marginStart="4dp"
-                                  android:gravity="center" android:paddingTop="4dp" android:paddingBottom="4dp" android:background="@drawable/red_btn"
-                                  android:text="Exit" android:textColor="#FFFFFF" android:textSize="11sp" android:textStyle="bold"
-                                  android:singleLine="true"/>
-                          </LinearLayout>
-                          <LinearLayout android:layout_width="wrap_content" android:layout_height="0dp" android:layout_weight="1"
-                              android:orientation="horizontal" android:gravity="center_vertical">
-                              <TextView android:layout_width="66dp" android:layout_height="wrap_content" android:text="Short 4H"
-                                  android:textColor="#FFFFFF" android:textSize="13sp" android:textStyle="bold" android:singleLine="true"/>
-                              <TextView android:id="@+id/ms4e" android:layout_width="46dp" android:layout_height="wrap_content"
-                                  android:gravity="center" android:paddingTop="4dp" android:paddingBottom="4dp" android:background="@drawable/idx_btn"
-                                  android:text="Enter" android:textColor="#FFFFFF" android:textSize="11sp" android:textStyle="bold"
-                                  android:singleLine="true"/>
-                              <TextView android:id="@+id/ms4x" android:layout_width="46dp" android:layout_height="wrap_content" android:layout_marginStart="4dp"
-                                  android:gravity="center" android:paddingTop="4dp" android:paddingBottom="4dp" android:background="@drawable/red_btn"
-                                  android:text="Exit" android:textColor="#FFFFFF" android:textSize="11sp" android:textStyle="bold"
-                                  android:singleLine="true"/>
-                          </LinearLayout>
-                          <LinearLayout android:layout_width="wrap_content" android:layout_height="0dp" android:layout_weight="1"
-                              android:orientation="horizontal" android:gravity="center_vertical">
-                              <TextView android:id="@+id/chartbtn" android:layout_width="79dp" android:layout_height="wrap_content"
-                                  android:gravity="center" android:paddingTop="4dp" android:paddingBottom="4dp" android:background="@drawable/purple_btn"
+                              <TextView android:id="@+id/chartbtn" android:layout_width="80dp" android:layout_height="wrap_content" android:layout_gravity="center_vertical"
+                                  android:gravity="center" android:paddingTop="5dp" android:paddingBottom="5dp" android:background="@drawable/purple_btn"
                                   android:text="CHART" android:textColor="#FFFFFF" android:textSize="11sp" android:textStyle="bold"
                                   android:singleLine="true"/>
-                              <TextView android:id="@+id/stratbtn" android:layout_width="79dp" android:layout_height="wrap_content" android:layout_marginStart="4dp"
-                                  android:gravity="center" android:paddingTop="4dp" android:paddingBottom="4dp" android:background="@drawable/purple_btn"
+                          </FrameLayout>
+                          <FrameLayout android:layout_width="wrap_content" android:layout_height="0dp" android:layout_weight="1">
+                              <TextView android:id="@+id/stratbtn" android:layout_width="80dp" android:layout_height="wrap_content" android:layout_gravity="center_vertical"
+                                  android:gravity="center" android:paddingTop="5dp" android:paddingBottom="5dp" android:background="@drawable/purple_btn"
                                   android:text="TT" android:textColor="#FFFFFF" android:textSize="11sp" android:textStyle="bold"
                                   android:singleLine="true"/>
-                          </LinearLayout>
-                          <LinearLayout android:layout_width="wrap_content" android:layout_height="0dp" android:layout_weight="1"
-                              android:orientation="horizontal" android:gravity="center_vertical">
-                              <TextView android:id="@+id/trigbtn" android:layout_width="79dp" android:layout_height="wrap_content"
-                                  android:gravity="center" android:paddingTop="4dp" android:paddingBottom="4dp" android:background="@drawable/purple_btn"
+                          </FrameLayout>
+                          <FrameLayout android:layout_width="wrap_content" android:layout_height="0dp" android:layout_weight="1">
+                              <TextView android:id="@+id/trigbtn" android:layout_width="80dp" android:layout_height="wrap_content" android:layout_gravity="center_vertical"
+                                  android:gravity="center" android:paddingTop="5dp" android:paddingBottom="5dp" android:background="@drawable/purple_btn"
                                   android:text="TRIG" android:textColor="#FFFFFF" android:textSize="11sp" android:textStyle="bold"
                                   android:singleLine="true"/>
-                              <TextView android:id="@+id/idxbtn" android:layout_width="79dp" android:layout_height="wrap_content" android:layout_marginStart="4dp"
-                                  android:gravity="center" android:paddingTop="4dp" android:paddingBottom="4dp" android:background="@drawable/purple_btn"
+                          </FrameLayout>
+                          <FrameLayout android:layout_width="wrap_content" android:layout_height="0dp" android:layout_weight="1">
+                              <TextView android:id="@+id/tradebtn" android:layout_width="80dp" android:layout_height="wrap_content" android:layout_gravity="center_vertical"
+                                  android:gravity="center" android:paddingTop="5dp" android:paddingBottom="5dp" android:background="@drawable/purple_btn"
+                                  android:text="TRADE" android:textColor="#FFFFFF" android:textSize="11sp" android:textStyle="bold"
+                                  android:singleLine="true"/>
+                          </FrameLayout>
+                          <FrameLayout android:layout_width="wrap_content" android:layout_height="0dp" android:layout_weight="1">
+                              <TextView android:id="@+id/idxbtn" android:layout_width="80dp" android:layout_height="wrap_content" android:layout_gravity="center_vertical"
+                                  android:gravity="center" android:paddingTop="5dp" android:paddingBottom="5dp" android:background="@drawable/purple_btn"
                                   android:text="INDICES" android:textColor="#FFFFFF" android:textSize="11sp" android:textStyle="bold"
                                   android:singleLine="true"/>
-                          </LinearLayout>
+                          </FrameLayout>
                       </LinearLayout>
                       <!-- right: Tradetron lines, prices, PnL, ADX -->
                       <LinearLayout android:layout_width="0dp" android:layout_weight="1" android:layout_height="match_parent"
