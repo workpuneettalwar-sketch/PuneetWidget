@@ -836,7 +836,33 @@ jobs:
               fun alpha(c: Context) = sp(c).getInt("alpha", 180)
               fun tsize(c: Context) = sp(c).getInt("tsize", 15)
               fun tf(c: Context) = sp(c).getString("tf", "15m")!!
-              fun str(c: Context, k: String) = sp(c).getString(k, "")!!.trim()
+              /** Current Tradetron trade links (checked 27 Nov 2026). Used when a link is empty or still points to a retired template. */
+              val LINKS = mapOf(
+                  "link_le" to "https://api.tradetron.tech/api?auth-token=2cea339e-aac2-4f2c-ab48-75b27984f288&key=go&value=1",
+                  "link_lx" to "https://api.tradetron.tech/api?auth-token=2cea339e-aac2-4f2c-ab48-75b27984f288&key=kill&value=1",
+                  "link_se" to "https://api.tradetron.tech/api?auth-token=4f218521-56ae-419b-b306-65f4adb8f5ad&key=go&value=1",
+                  "link_sx" to "https://api.tradetron.tech/api?auth-token=4f218521-56ae-419b-b306-65f4adb8f5ad&key=kill&value=1",
+                  "link_l4e" to "https://api.tradetron.tech/api?auth-token=cf2fada4b7a825d7463fe5a44aba5613&key=go&value=1",
+                  "link_l4x" to "https://api.tradetron.tech/api?auth-token=cf2fada4b7a825d7463fe5a44aba5613&key=kill&value=1",
+                  "link_s4e" to "https://api.tradetron.tech/api?auth-token=c3599e137885394a60aa99282fc77ddc&key=go&value=1",
+                  "link_s4x" to "https://api.tradetron.tech/api?auth-token=c3599e137885394a60aa99282fc77ddc&key=kill&value=1",
+                  "link_ue" to "https://api.tradetron.tech/api?auth-token=ba35faa9-8bd0-46cc-bef6-e10d9e72a445&key=go&value=1",
+                  "link_ux" to "https://api.tradetron.tech/api?auth-token=ba35faa9-8bd0-46cc-bef6-e10d9e72a445&key=kill&value=1",
+                  "link_de" to "https://api.tradetron.tech/api?auth-token=ad416938-d968-45e3-bd6e-160fd9145895&key=go&value=1",
+                  "link_dx" to "https://api.tradetron.tech/api?auth-token=ad416938-d968-45e3-bd6e-160fd9145895&key=kill&value=1",
+                  "link_u4e" to "https://api.tradetron.tech/api?auth-token=40d09559-e1fa-4c4d-b008-64ede251668f&key=go&value=1",
+                  "link_u4x" to "https://api.tradetron.tech/api?auth-token=40d09559-e1fa-4c4d-b008-64ede251668f&key=kill&value=1",
+                  "link_d4e" to "https://api.tradetron.tech/api?auth-token=6aff9a70-c759-42b7-be35-49fc9ecb8e05&key=go&value=1",
+                  "link_d4x" to "https://api.tradetron.tech/api?auth-token=6aff9a70-c759-42b7-be35-49fc9ecb8e05&key=kill&value=1"
+              )
+              val RETIRED = listOf("01953881d3d426d23d1b4843ea8d316d", "bcf6f8e7bb2254800625ca462ad08964",
+                  "670b61c932eecb31c65c169a63ee0690", "c2548a05442113838f3925d73a912913")
+              fun str(c: Context, k: String): String {
+                  val v = sp(c).getString(k, "")!!.trim()
+                  val d = LINKS[k] ?: return v
+                  if (v.isEmpty() || RETIRED.any { v.contains(it) }) { sp(c).edit().putString(k, d).apply(); return d }
+                  return v
+              }
               /** Delta India's fixed USD-INR rate is 85. Blank = 85, type "usd" to show dollars, or any number to override. */
               fun rate(c: Context): Double {
                   val v = str(c, "rate")
@@ -972,7 +998,7 @@ jobs:
                   fun field(k: String, hint: String) {
                       label(hint)
                       root.addView(EditText(this).apply {
-                          setText(sp.getString(k, "")); setSingleLine()
+                          setText(if (k.startsWith("link_")) Prefs.str(this@SettingsActivity, k) else sp.getString(k, "")); setSingleLine()
                           doAfterTextChanged { sp.edit().putString(k, it.toString().trim()).apply() }
                       })
                   }
